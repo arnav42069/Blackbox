@@ -1,11 +1,11 @@
 <div align="center">
 <img src="assets/blackbox-terminal.gif" alt="BlackBox terminal animation" width="850">
-<img src="assets/blkboxtitle.svg" alt="BLACKBOX" width="650">
+
 <h1>Blackbox: Local-first AI security workbench for authorized labs</h1>
 
 **Ollama-powered · Scope-enforced · Evidence-driven · Built for Omarchy/Linux**
 </div>
-
+<img src="assets/blkboxtitle.svg" alt="BLACKBOX" width="650">
 <div align="left">
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
