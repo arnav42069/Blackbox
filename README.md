@@ -1,6 +1,6 @@
 <div align="center">
 <img src="assets/blackbox-terminal.gif" alt="BlackBox terminal animation" width="850">
-### Local-first AI security workbench for authorized labs
+<h1>Local-first AI security workbench for authorized labs</h1>
 
 **Ollama-powered · Scope-enforced · Evidence-driven · Built for Omarchy/Linux**
 
