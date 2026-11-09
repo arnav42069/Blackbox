@@ -1,0 +1,17 @@
+.venv/
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.db*
+*.egg-info/
+build/
+test-results/
+playwright-report/
+.runtime/
+ssh_profiles.yaml
+attachments/
+artifacts/
+*.log

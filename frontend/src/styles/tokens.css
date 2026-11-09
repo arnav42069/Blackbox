@@ -1,0 +1,34 @@
+/* BlackTurq upstream palette; derived surface tokens are BlackBox design choices. */
+:root {
+  color-scheme: dark;
+  --bt-bg: #0a0a0a;
+  --bt-fg: #c8dcdc;
+  --bt-accent: #adf0e9;
+  --bt-cursor: #75dddd;
+  --bt-select-bg: #c8dcdc;
+  --bt-select-fg: #0a0a0a;
+  --bt-red: #d35f5f;
+  --bt-green: #8fecd5;
+  --bt-cyan-muted: #a9d1d7;
+  --bt-muted-deep: #485362;
+  --bt-muted: #5a676b;
+  --bt-terminal-bright: #d2d9db;
+  --bt-ansi-black: #0a0a0a;
+  --bt-ansi-bright-black: #322f3b;
+  --surface-0: #0a0a0a;
+  --surface-1: #101616;
+  --surface-2: #152020;
+  --surface-hover: #1b2929;
+  --border: #294042;
+  --border-active: #75dddd;
+  --text-secondary: #a9c5c5;
+  --text-disabled: #718b8b;
+  --accent-soft: rgba(173,240,233,.10);
+  --effect-line: rgba(173,240,233,.02);
+  --shadow-accent: rgba(117,221,221,.15);
+  --mono: 'JetBrains Mono', 'Iosevka', 'Cascadia Code', ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; min-height: 100%; background: var(--bt-bg); color: var(--bt-fg); }
+::selection { color: var(--bt-select-fg); background: var(--bt-select-bg); }
+:focus-visible { outline: 2px solid var(--bt-accent); outline-offset: 2px; }

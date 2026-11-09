@@ -1,0 +1,11 @@
+model: qwen3.5:4b
+mode: auto_safe
+num_ctx: 8192
+temperature: 0.2
+keep_alive: 20m
+think: false
+max_tool_calls: 20
+max_turns: 12
+max_wall_seconds: 300
+retention_days: 30
+visual_effects: false

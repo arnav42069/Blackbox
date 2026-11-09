@@ -1,0 +1,1 @@
+{"compilerOptions":{"baseUrl":"../frontend","paths":{"@playwright/test":["node_modules/@playwright/test"]},"module":"ESNext","moduleResolution":"Bundler","target":"ES2022"}}

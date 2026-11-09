@@ -1,0 +1,14 @@
+@import './styles/tokens.css';
+@import './styles/layout.css';
+@import './styles/components.css';
+body { font: 14px/1.5 system-ui, sans-serif; }
+button,input,select,textarea { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; color: var(--text-disabled); }
+button, input, select, textarea { background: var(--surface-1); color: var(--bt-fg); border: 1px solid var(--border); border-radius: 3px; padding: 7px 10px; }
+button:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--text-disabled); }
+a { color: var(--bt-cyan-muted); }
+code,pre,.mono { font-family: var(--mono); }
+pre { font-size: 12px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; background: var(--surface-0); padding: 10px; border: 1px solid var(--border); }
+small,.secondary { color: var(--text-secondary); }
+@media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
