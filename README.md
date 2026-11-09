@@ -1,12 +1,10 @@
 <div align="center">
-
-# ⬛ BLACKBOX
-
+![BlackBox terminal animation](assets/blackbox-terminal.gif)
 ### Local-first AI security workbench for authorized labs
 
 **Ollama-powered · Scope-enforced · Evidence-driven · Built for Omarchy/Linux**
 
-![BlackBox terminal animation](assets/blackbox-terminal.gif)
+
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
