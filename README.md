@@ -1,5 +1,5 @@
 <div align="center">
-![BlackBox terminal animation](assets/blackbox-terminal.gif)
+<img src="assets/blackbox-terminal.gif" alt="BlackBox terminal animation" width="850">
 ### Local-first AI security workbench for authorized labs
 
 **Ollama-powered · Scope-enforced · Evidence-driven · Built for Omarchy/Linux**
