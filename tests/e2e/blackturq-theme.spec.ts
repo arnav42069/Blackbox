@@ -32,8 +32,9 @@ for(const [width,height] of [[1440,900],[1024,768],[390,844]]){
     await page.getByLabel('Message',{exact:true}).focus();
     expect(await page.getByLabel('Message',{exact:true}).evaluate(e=>getComputedStyle(e.closest('.composer')!).borderColor)).toBe('rgb(117, 221, 221)');
     expect(await page.locator('.workbench').getAttribute('class')).not.toContain('effects');
-    mkdirSync('../docs/screenshots',{recursive:true});
-    await page.screenshot({path:`../docs/screenshots/blackbox-${width}.png`});
+    const screenshots=process.env.BLACKBOX_QA_REPORT ? `${process.env.BLACKBOX_QA_REPORT}/screenshots` : '../docs/screenshots';
+    mkdirSync(screenshots,{recursive:true});
+    await page.screenshot({path:`${screenshots}/blackbox-${width}.png`});
   });
 }
 

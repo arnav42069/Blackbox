@@ -15,3 +15,10 @@ ssh_profiles.yaml
 attachments/
 artifacts/
 *.log
+
+# Private QA evidence and isolated repair worktrees
+qa-reports/
+
+# Also ignore dependency symlinks in QA worktrees
+.venv
+node_modules

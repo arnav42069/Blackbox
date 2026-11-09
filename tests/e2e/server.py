@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -46,15 +47,28 @@ class SlowTransport(httpx.AsyncBaseTransport):
 if __name__=='__main__':
     with tempfile.TemporaryDirectory(prefix='blackbox-e2e-') as root:
         path=Path(root)
-        settings=Settings(port=8876,data_dir=path/'data',config_dir=path/'config')
+        port=int(os.environ.get('BLACKBOX_E2E_PORT', '8876'))
+        settings=Settings(port=port,data_dir=path/'data',config_dir=path/'config')
         settings.prefs.model='fixture:4b'
         app=create_app(settings,SlowTransport())
-        runtime=Path(__file__).resolve().parents[2]/'.runtime'
+        runtime=Path(os.environ.get('BLACKBOX_E2E_RUNTIME', str(Path(__file__).resolve().parents[2]/'.runtime')))
+        runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         runtime.mkdir(exist_ok=True)
         (runtime/'e2e-bearer').unlink(missing_ok=True)
         atomic_write(runtime/'e2e-pair',app.state.auth.pairing.encode())
         try:
-            uvicorn.run(app,host='127.0.0.1',port=8876,log_level='warning',access_log=False)
+            uvicorn.run(app,host='127.0.0.1',port=port,log_level='warning',access_log=False)
         finally:
+            if report := os.environ.get('BLACKBOX_QA_REPORT'):
+                from scripts.qa_support import write_json
+                # Uvicorn lifespan closed the DB: use a fresh read-only connection.
+                import sqlite3
+                connection=sqlite3.connect(f'file:{settings.data_dir}/blackbox.db?mode=ro', uri=True)
+                connection.row_factory=sqlite3.Row
+                write_json(Path(report)/'browser-tool-journal.json', {
+                    'source':'isolated_browser_fixture',
+                    'tools':[dict(row) for row in connection.execute('SELECT * FROM tool_events')],
+                    'events':[dict(row) for row in connection.execute('SELECT * FROM event_journal')]})
+                connection.close()
             (runtime/'e2e-bearer').unlink(missing_ok=True)
             (runtime/'e2e-pair').unlink(missing_ok=True)

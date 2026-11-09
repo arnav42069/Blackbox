@@ -20,5 +20,5 @@ where = ["backend"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests/unit", "tests/integration"]
+testpaths = ["tests/unit", "tests/integration", "tests/qa"]
 pythonpath = ["backend", "."]
