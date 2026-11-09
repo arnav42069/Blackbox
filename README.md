@@ -48,7 +48,7 @@ BlackBox is a local Ollama chat workbench for security learning and **explicitly
 │ SESSIONS         │ TERMINAL / CHAT                        │ LIVE ACTIVITY       │
 │                  │                                        │                     │
 │ + New session    │  TARGET: scope required                │ Tool requests       │
-│                  │  MODEL: local Ollama                    │ Executed arguments  │
+│                  │  MODEL: local Ollama                   │ Executed arguments  │
 │ Previous runs    │                                        │ Results / denials   │
 │                  │  Ask BlackBox...                       │ Evidence timeline   │
 └──────────────────┴────────────────────────────────────────┴─────────────────────┘
