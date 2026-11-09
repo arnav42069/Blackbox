@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.qa_support import sanitize, write_json
 from scripts.qa_metrics import failure_count
+from scripts.qa_focus import REPAIR_SCHEMA, concise_failures, failure_excerpts, failure_groups, relevant_sources, token_usage
 
 # A repair cannot alter its oracle, permissions, dependencies or the controller.
 ALLOWED = ('frontend/src/', 'backend/blackbox/')
@@ -29,6 +30,11 @@ PROTECTED = ('backend/blackbox/app.py', 'backend/blackbox/core/agent.py',
              'frontend/src/api.ts', 'frontend/src/components/Dialogs.tsx', 'backend/blackbox/core/policy.py', 'backend/blackbox/core/scope.py',
              'backend/blackbox/api/', 'backend/blackbox/settings.py',
              'backend/blackbox/tools/', 'backend/blackbox/storage/files.py')
+# Completion, rendering and approval UI also contain security controls.
+PROTECTED += ('backend/blackbox/core/completion.py', 'backend/blackbox/storage/images.py',
+              'backend/blackbox/storage/retention.py', 'backend/blackbox/cli.py',
+              'frontend/src/components/Messages.tsx', 'frontend/src/components/Activity.tsx',
+              'frontend/src/app.tsx')
 
 
 class Intervention(RuntimeError):
@@ -233,7 +239,8 @@ def junit_results(path):
         name = node.get('name', '')
         classname = node.get('classname', '')
         # JUnit class names from these Python tests map to normal pytest nodeids.
-        nodeid = classname.replace('.', '/') + '.py::' + name
+        properties = {p.get('name'): p.get('value') for p in node.findall('properties/property')}
+        nodeid = properties.get('qa_nodeid') or classname.replace('.', '/') + '.py::' + name
         results.append({'id': nodeid, 'status': status, 'category': category(nodeid, detail), 'detail': sanitize(detail)})
     return results
 
@@ -245,7 +252,9 @@ def playwright_results(path):
         for spec in suite.get('specs', []):
             for test in spec.get('tests', []):
                 status = test['status']
-                results.append({'id': f"e2e:{spec['file']}:{spec['title']}",
+                project = test.get('projectName', '')
+                results.append({'id': f"e2e:{spec['file']}:{spec.get('line', 0)}:{spec['title']}" + (':' + project if project else ''),
+                    'file': spec['file'], 'line': spec.get('line'), 'title': spec['title'], 'project': project,
                     'status': 'passed' if status == 'expected' else 'skipped' if status == 'skipped' else 'failed',
                     'category': category('e2e ' + spec['title']), 'detail': sanitize(test.get('results', []))})
         for child in suite.get('suites', []):
@@ -276,7 +285,8 @@ class Loop:
                      'status': 'running', 'cycles': [], 'repairs': [], 'limits': vars(args),
                      'coverage_limits': ['Physical Wayland clipboard and external labs are not exercised.',
                          'Only synthetic sessions and explicitly scoped localhost fixtures are used.'],
-                     'commands': []}
+                     'commands': [], 'failure_groups': [], 'worker_tokens': 0,
+                     'worker_usage_complete': True}
 
     def save(self):
         self.data['stop_request'] = self.stop_request
@@ -289,6 +299,10 @@ class Loop:
         for cycle in self.data['cycles']:
             results = cycle['results']
             lines.append(f"| {cycle['index']} | {sum(r['status']=='passed' for r in results)} | {failure_count(results)} | {sum(r['status']=='skipped' for r in results)} |")
+        lines += ['', f"Measured worker tokens: {self.data['worker_tokens']} (usage complete: {self.data['worker_usage_complete']})."]
+        for repair in self.data['repairs']:
+            lines.append(f"- {repair['group']} attempt {repair['attempt']}: {repair['reasoning']}, {repair['result']}; "
+                         f"tokens={repair.get('tokens', 'unavailable')}, seconds={repair.get('elapsed_seconds', 'pending')}")
         lines += ['', 'Evidence: per-cycle JUnit, Playwright JSON, screenshots, API/console/network logs, host/tool journals, and bounded worker event logs.', '']
         for cycle in self.data['cycles']:
             for result in cycle['results']:
@@ -377,6 +391,7 @@ class Loop:
             # Retain event metadata, exit codes and usage; never raw model reasoning/stdout.
             if worker:
                 events = []
+                self.worker_edits = None
                 for line in text.splitlines():
                     try:
                         event = json.loads(line)
@@ -386,12 +401,23 @@ class Loop:
                     if event.get('type') in {'error','turn.failed'}:
                         safe['error'] = sanitize(str(event.get('message', event.get('error', 'Worker failed')))[:1000])
                     item = event.get('item', {})
+                    if event.get('type') == 'item.completed' and item.get('type') == 'agent_message':
+                        try:
+                            proposal = json.loads(item.get('text', ''))
+                            self.worker_edits = proposal.get('edits') if isinstance(proposal, dict) else None
+                        except ValueError:
+                            self.worker_edits = None
                     if item:
                         safe['item'] = {k: item[k] for k in ('id', 'type', 'status', 'exit_code') if k in item}
                     events.append(safe)
                 write_json(output, {'events': events, 'exit_code': process.returncode, 'raw_output_retained': False})
-                tokens = sum(e.get('usage', {}).get('input_tokens', 0) + e.get('usage', {}).get('output_tokens', 0) for e in events)
-                self.data['worker_tokens'] = self.data.get('worker_tokens', 0) + tokens
+                usage = token_usage(events)
+                record['token_usage'] = usage
+                record['usage_complete'] = usage is not None and process.returncode == 0
+                if not record['usage_complete']:
+                    self.data['worker_usage_complete'] = False
+                if usage is not None:
+                    self.data['worker_tokens'] += usage['total_tokens']
             else:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(sanitize(text))
@@ -409,40 +435,56 @@ class Loop:
                 'PLAYWRIGHT_JSON_OUTPUT_FILE': str(directory / 'playwright.json'),
                 'BLACKBOX_QA_PYTHON': str(ROOT / '.venv/bin/python')}
 
-    def suite(self, workspace, index, focused=()):
+    def suite(self, workspace, index, *, stage='regression', targets=None):
         self.check()
         directory = self.report / f'cycle-{index}'
         directory.mkdir(mode=0o700)
         env = self.environment(workspace, directory)
         python = str(ROOT / '.venv/bin/python')
-        cycle = {'index': index, 'results': [], 'focused': list(focused)}
+        cycle = {'index': index, 'stage': stage, 'results': [], 'targets': targets}
         self.data['cycles'].append(cycle)
         results = cycle['results']
-        for label, targets in ([('focused', list(focused))] if focused else []) + [('backend', ['tests/unit', 'tests/integration', 'tests/qa'])]:
+        selection = dict(targets) if targets is not None else {
+            'pytest': ['tests/unit', 'tests/integration', 'tests/qa'],
+            'frontend': ['typecheck', 'build'], 'browser': [[]]}
+        # Browser fixtures serve dist/, so rebuilding is a prerequisite, not a retest.
+        frontend = list(selection.get('frontend', []))
+        if selection.get('browser') and 'build' not in frontend:
+            frontend.append('build')
+        for label, nodes in ([('backend', selection['pytest'])] if selection.get('pytest') else []):
             xml = directory / (label + '.xml')
-            code = self.command([python, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-p', 'scripts.qa_pytest', f'--junitxml={xml}', *targets], workspace, directory / (label + '.log'), env=env)
+            code = self.command([python, '-m', 'pytest', '-q', '--tb=short', '-p', 'no:cacheprovider', '-p', 'scripts.qa_pytest', f'--junitxml={xml}', *nodes], workspace, directory / (label + '.log'), env=env)
             parsed = junit_results(xml) if xml.exists() else []
-            if label != 'focused':
-                results.extend(parsed)
+            results.extend(parsed)
             cycle[label + '_exit_code'] = code
-            if code and not any(r['status'] == 'failed' for r in parsed):
+            if not parsed or (code and not any(r['status'] == 'failed' for r in parsed)):
                 results.append({'id': label + ':runner', 'status': 'failed', 'category': 'infrastructure', 'detail': f'pytest exited {code}; see {label}.log'})
-        for label in ('typecheck', 'build'):
+        build_failed = False
+        for label in frontend:
             code = self.command(['npm', 'run', label], workspace / 'frontend', directory / (label + '.log'), env=env)
-            results.append({'id': label, 'status': 'failed' if code else 'passed', 'category': 'ui_failure', 'detail': f'exit={code}; see {label}.log'})
+            results.append({'id': label, 'status': 'failed' if code else 'passed', 'category': 'ui_failure',
+                            'detail': (directory / (label + '.log')).read_text()[-6000:] if code else f'exit={code}'})
+            if label == 'build' and code:
+                build_failed = True
         # Never kill or pair with an existing user service; fail with an actionable precondition.
-        with socket.socket() as sock:
-            busy = sock.connect_ex(('127.0.0.1', self.args.test_port)) == 0
-        if busy:
-            results.append({'id': 'e2e:port', 'status': 'failed', 'category': 'infrastructure', 'detail': f'Port {self.args.test_port} is occupied. Close BlackBox or choose --test-port for an isolated normally paired QA instance.'})
-        else:
-            code = self.command(['npm', 'run', 'test:e2e', '--', '--reporter=json'], workspace / 'frontend', directory / 'browser.log', env=env)
-            path = directory / 'playwright.json'
+        for browser_index, selectors in enumerate(selection.get('browser', [])):
+            if build_failed:
+                results.append({'id': 'e2e:build', 'status': 'skipped', 'category': 'ui_failure',
+                                'detail': 'Browser checks require a successful build; stale output is never used.'})
+                break
+            with socket.socket() as sock:
+                busy = sock.connect_ex(('127.0.0.1', self.args.test_port)) == 0
+            if busy:
+                results.append({'id': 'e2e:port', 'status': 'failed', 'category': 'infrastructure', 'detail': f'Port {self.args.test_port} is occupied. Close BlackBox or choose --test-port for an isolated normally paired QA instance.'})
+                break
+            env['PLAYWRIGHT_JSON_OUTPUT_FILE'] = str(directory / f'playwright-{browser_index}.json') if selectors else str(directory / 'playwright.json')
+            code = self.command(['npm', 'run', 'test:e2e', '--', '--reporter=json', *selectors], workspace / 'frontend', directory / f'browser{browser_index or ""}.log', env=env)
+            path = Path(env['PLAYWRIGHT_JSON_OUTPUT_FILE'])
             parsed = playwright_results(path) if path.exists() else []
             results.extend(parsed)
             if not parsed or (code and not any(r['status'] == 'failed' for r in parsed)):
                 results.append({'id': 'e2e:runner', 'status': 'failed', 'category': 'infrastructure', 'detail': f'Browser runner exit={code}; see browser.log'})
-        if self.args.model and index == 0:
+        if self.args.model and targets is None:
             code = self.command([python, 'scripts/qa_models.py', self.args.model, str(directory / 'models.json')], workspace, directory / 'models.log', env=env, timeout=self.args.probe_seconds)
             results.append({'id': 'ollama:actual_probes', 'status': 'failed' if code else 'passed', 'category': 'model_capability', 'detail': f'exit={code}; see models.json'})
         elif index == 0:
@@ -456,29 +498,216 @@ class Loop:
         self.save()
         return cycle
 
-    def repair(self, workspace, cycle, number):
+    @staticmethod
+    def focused_targets(group):
+        if group['kind'] == 'pytest':
+            return {'pytest': [r['id'] for r in group['failures']]}
+        if group['kind'] == 'browser':
+            # A source line can generate several tests; title + project makes it exact.
+            return {'browser': [[f"{re.escape(r['file'])}:{r['line']}", '--grep', re.escape(r['title']) + '$',
+                                 *(['--project', r['project']] if r.get('project') else [])]
+                                for r in group['failures']]}
+        if group['kind'] == 'frontend':
+            return {'frontend': [r['id'] for r in group['failures']]}
+        raise Intervention('No reliable focused command for ' + group['id'])
+
+    @staticmethod
+    def subsystem_targets(group, changed):
+        selection = {}
+        if group['kind'] == 'pytest':
+            selection['pytest'] = [str(Path(group['target']).parent)]
+        if any(name.startswith('backend/') for name in changed):
+            # Shared app fixtures and dynamic tool dispatch cross Python test directories.
+            selection['pytest'] = ['tests/unit', 'tests/integration', 'tests/qa']
+        elif any(name.startswith('scripts/') for name in changed):
+            selection['pytest'] = sorted(set(selection.get('pytest', []) + ['tests/qa']))
+        if group['kind'] in {'browser', 'frontend'} or any(name.startswith('frontend/') for name in changed):
+            selection.update(frontend=['typecheck', 'build'], browser=[[]])
+        return selection
+
+    def repair(self, workspace, group, number):
         ensure_writer(self.writer_root)
-        failures = [r for r in cycle['results'] if r['status'] == 'failed']
+        failures = group['failures']
         # Environment failures and controls require intervention, never edits to weaken tests/policy.
         if any(r['category'] in {'infrastructure', 'scope_enforcement', 'model_capability'} for r in failures):
             raise Intervention('Failure requires environment, scope or model intervention; automated repair refused')
-        prompt = ('Fix the grounded failures below in this BlackBox worktree. Read README.md and existing code. '
-                  'Only edit ' + ('scripts/qa_metrics.py' if self.args.demo else 'application files under backend/blackbox or frontend/src') + '. '
+        remaining = self.args.max_worker_tokens - self.data['worker_tokens']
+        if remaining <= 0:
+            raise Halt('Worker token budget exhausted')
+        reasoning = 'high' if group['attempts'] == 2 else self.args.worker_reasoning
+        prompt = ('Propose the smallest fix for this reproduced failure group. '
+                  'Return JSON matching the supplied schema: edits with path, exact old text and replacement new text. '
+                  'Each old text must occur exactly once. Do not edit files yourself or use an editing tool. '
+                  'Only propose edits to ' + ('scripts/qa_metrics.py' if self.args.demo else 'application files under backend/blackbox or frontend/src') + '. '
                   'Do not edit tests, any other QA harness code, security/policy/scope/auth/tool executors, dependencies, config or prompts. '
                   'Do not run git mutations, external targets, sudo, destructive commands, or read user home files. '
                   'Use existing fixed tests as the oracle. No fabricated output or test weakening. '
-                  'If a security or destructive change is necessary, stop and explain. Return after the minimal fix.\n'
-                  + json.dumps(sanitize(failures)) + '\nFocused rerun targets: ' + json.dumps([r['id'] for r in failures]))
+                  'If a security or destructive change is necessary, stop and explain. '
+                  'Current test/source excerpts are supplied below; use them directly without rereading those files. '
+                  'Batch any necessary additional reads in one command. Return replacements immediately when excerpts suffice. '
+                  'The controller owns all testing and Git checks; do not run tests, git commands or inspect QA history. '
+                  f'Use at most {remaining} input+output tokens; return after the minimal fix.\n'
+                  + json.dumps(sanitize({'failures': concise_failures(failures),
+                      'focused_targets': self.focused_targets(group), 'source_files': group['source_files'],
+                      'excerpts': failure_excerpts(workspace, failures, group['source_files']),
+                      'previous_attempt': group.get('last_result')})))
+        if len(prompt) > 24000:
+            raise Intervention('Failure group exceeds concise worker context budget; split requires review')
         log = self.report / f'worker-{number}.json'
-        self.data['repairs'].append({'cycle': number, 'log': log.name})
-        code = self.command(['codex', 'exec', '--ignore-user-config', '--sandbox', 'workspace-write',
+        schema = self.report / 'repair-schema.json'
+        write_json(schema, REPAIR_SCHEMA)
+        record = {'cycle': number, 'group': group['id'], 'attempt': group['attempts'], 'reasoning': reasoning,
+                  'remaining_token_budget': remaining, 'log': log.name, 'result': 'running',
+                  'prompt_bytes': len(prompt.encode())}
+        self.data['repairs'].append(record)
+        started = time.monotonic()
+        self.worker_edits = None
+        try:
+            code = self.command(['codex', 'exec', '--ignore-user-config', '--sandbox', 'workspace-write',
                              '--config', 'approval_policy="never"', '--config', 'sandbox_workspace_write.network_access=false',
-                             '--config', 'features.multi_agent=false', '--json', '--ephemeral', '-C', str(workspace), '-'],
+                             '--config', f'model_reasoning_effort="{reasoning}"',
+                             '--config', 'features.multi_agent=false', '--output-schema', str(schema),
+                             '--json', '--ephemeral', '-C', str(workspace), '-'],
                             workspace, log, prompt=prompt, timeout=self.args.worker_seconds, worker=True)
-        if code:
-            raise Intervention(f'Codex worker exited {code}; inspect bounded worker event log')
-        if self.data.get('worker_tokens', 0) > self.args.max_worker_tokens:
-            raise Halt('Worker token budget exhausted (measured at turn completion)')
+            usage = self.data['commands'][-1].get('token_usage')
+            record.update(exit_code=code, usage=usage, tokens=usage['total_tokens'] if usage else None)
+            if code:
+                raise Intervention(f'Codex worker exited {code}; inspect bounded worker event log')
+            if not usage:
+                raise Intervention('Worker usage unavailable; cannot verify token budget')
+            if self.data['worker_tokens'] > self.args.max_worker_tokens:
+                raise Halt('Worker token budget exhausted (measured at turn completion)')
+            record['proposal_edits'] = self.apply_worker_edits(workspace, self.worker_edits)
+            record['result'] = 'awaiting_validation'
+        except BaseException:
+            record['result'] = 'worker_failed_or_budget_stopped'
+            raise
+        finally:
+            record['elapsed_seconds'] = round(time.monotonic() - started, 2)
+            self.save()
+
+    def allowed_repair_path(self, name):
+        if Path(name).is_absolute() or Path(name).as_posix() != name or any(part.startswith('.') for part in Path(name).parts):
+            return False
+        if self.args.demo:
+            return name == 'scripts/qa_metrics.py'
+        return name.startswith(ALLOWED) and not any(name == p or name.startswith(p) for p in PROTECTED)
+
+    def apply_worker_edits(self, workspace, edits):
+        """Validate the entire structured proposal before writing any source."""
+        if not isinstance(edits, list) or not 1 <= len(edits) <= 20:
+            raise Intervention('Worker returned no valid bounded repair proposal')
+        if len(json.dumps(edits)) > 200000:
+            raise Intervention('Repair proposal exceeds review budget')
+        staged = {}
+        for edit in edits:
+            if not isinstance(edit, dict) or set(edit) != {'path', 'old', 'new'} or not all(isinstance(v, str) for v in edit.values()):
+                raise Intervention('Malformed worker replacement')
+            name, old, new = edit['path'], edit['old'], edit['new']
+            path = workspace / name
+            if Path(name).is_absolute() or '..' in Path(name).parts or not self.allowed_repair_path(name):
+                raise Intervention('Worker proposed protected file ' + name)
+            if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(workspace.resolve()):
+                raise Intervention('Worker proposed creation/deletion/symlink changes')
+            source = staged[name] if name in staged else path.read_text()
+            if not old or old == new or source.count(old) != 1:
+                raise Intervention('Worker replacement does not uniquely match current source')
+            staged[name] = source.replace(old, new, 1)
+        for name, source in staged.items():
+            (workspace / name).write_text(source)
+        return len(edits)
+
+    def repair_groups(self, workspace, baseline, base, stable):
+        groups = failure_groups(baseline['results'])
+        baseline_failed = {r['id'] for r in baseline['results'] if r['status'] == 'failed'}
+        self.data['failure_groups'] = groups
+        if any(g['kind'] == 'intervention' or any(r['category'] in {
+                'infrastructure', 'scope_enforcement', 'model_capability'} for r in g['failures']) for g in groups):
+            raise Intervention('Failure requires environment, scope or model intervention; automated repair refused')
+        for group in groups:
+            group['source_files'] = relevant_sources(workspace, group['failures'])
+            focused = self.focused_targets(group)
+            reproduction = self.suite(workspace, len(self.data['cycles']), stage='reproduce', targets=focused)
+            expected = {r['id'] for r in group['failures']}
+            actual = {r['id'] for r in reproduction['results'] if r['status'] == 'failed'}
+            group['reproduction_cycle'] = reproduction['index']
+            if self.data['repairs'] and not actual and all(any(r['id'] == node and r['status'] == 'passed'
+                                      for r in reproduction['results']) for node in expected):
+                # A preceding group's fix can resolve a shared cause.
+                group['result'] = 'pending_regression'
+                continue
+            if actual != expected:
+                raise Intervention('Focused reproduction differs from baseline; unreliable or interacting failures')
+            group['failures'] = [r for r in reproduction['results'] if r['status'] == 'failed']
+            for attempt in (1, 2):
+                if len(self.data['repairs']) >= self.args.max_cycles:
+                    raise Halt('Maximum repair cycles reached')
+                group['attempts'] = attempt
+                # Git mutations and oracle edits are checked independently of the diff.
+                head = git(workspace, 'rev-parse', 'HEAD')
+                index = git(workspace, 'diff', '--cached', '--binary')
+                before = source_manifest(workspace)
+                before_files = {name: (workspace / name).read_bytes() for name in before}
+                self.repair(workspace, group, len(self.data['repairs']) + 1)
+                record = self.data['repairs'][-1]
+                try:
+                    if head != git(workspace, 'rev-parse', 'HEAD') or index != git(workspace, 'diff', '--cached', '--binary'):
+                        raise Intervention('Worker mutated Git history or index; changes never applied')
+                    self.validate_diff(workspace, base)
+                    after = source_manifest(workspace)
+                    changed = sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
+                    record['changed_files'] = changed
+                    import difflib
+                    worker_patch = ''.join(''.join(difflib.unified_diff(
+                        before_files[name].decode(errors='replace').splitlines(True),
+                        (workspace / name).read_text(errors='replace').splitlines(True),
+                        fromfile='a/' + name, tofile='b/' + name)) for name in changed)
+                    patch_file = self.report / f"worker-{record['cycle']}.patch"
+                    patch_file.write_text(sanitize(worker_patch))
+                    patch_file.chmod(0o600)
+                    stable()
+                    check = self.suite(workspace, len(self.data['cycles']), stage='focused', targets=focused)
+                    record['focused_cycle'] = check['index']
+                    failed = [r for r in check['results'] if r['status'] == 'failed']
+                    if {r['id'] for r in failed} - expected:
+                        raise Halt('Repair introduced new regression failures')
+                    if not failed:
+                        if not expected <= {r['id'] for r in check['results'] if r['status'] == 'passed'}:
+                            raise Intervention('Focused targets missing or skipped; repair cannot be verified')
+                        if not changed:
+                            raise Intervention('Focused test passed without a source change; inconsistent evidence')
+                        affected = self.suite(workspace, len(self.data['cycles']), stage='subsystem',
+                                              targets=self.subsystem_targets(group, changed))
+                        record['subsystem_cycle'] = affected['index']
+                        failed = [r for r in affected['results'] if r['status'] == 'failed']
+                        if {r['id'] for r in failed} - baseline_failed:
+                            raise Halt('Repair introduced new regression failures')
+                        # Other baseline groups are handled in their own bounded turn.
+                        failed = [r for r in failed if r['id'] in expected]
+                    if not failed:
+                        record['result'] = 'focused_and_subsystem_passed'
+                        group['result'] = 'pending_regression'
+                        break
+                    if any(r['category'] in {'infrastructure', 'scope_enforcement', 'model_capability'} for r in failed):
+                        raise Intervention('Retest requires environment, scope or model intervention')
+                    record['result'] = 'failure_persists'
+                    group['last_result'] = 'Failure persists after focused/subsystem retest; make a different minimal fix.'
+                    group['failures'] = failed
+                    if attempt == 2:
+                        raise Halt('Two attempts exhausted for failure group ' + group['id'])
+                except BaseException:
+                    record['result'] = 'rejected'
+                    group['result'] = 'rejected'
+                    raise
+                finally:
+                    self.save()
+        # Exactly one complete acceptance regression after all local checks succeed.
+        regression = self.suite(workspace, len(self.data['cycles']), stage='regression')
+        if failure_count(regression['results']):
+            raise Halt('Complete regression failed; repairs not accepted')
+        if not baseline_failed <= {r['id'] for r in regression['results'] if r['status'] == 'passed'}:
+            raise Intervention('Repaired targets missing or skipped in complete regression')
+        return regression
 
     def validate_diff(self, workspace, base):
         names = git(workspace, 'diff', '--name-only', base).splitlines()
@@ -486,9 +715,7 @@ class Loop:
         if untracked:
             raise Intervention('Worker created unreviewed files; retained in worktree for intervention')
         for name in names:
-            if self.args.demo and name == 'scripts/qa_metrics.py':
-                continue
-            if not name.startswith(ALLOWED) or any(name == p or name.startswith(p) for p in PROTECTED):
+            if not self.allowed_repair_path(name):
                 raise Intervention(f'Worker modified protected file {name}; changes retained, never applied')
             path = workspace / name
             if not path.is_file() or path.is_symlink():
@@ -545,65 +772,46 @@ class Loop:
                 target.write_text(source.replace("result['status'] == 'failed'", "result['status'] != 'passed'"))
                 self.data['demo_seed'] = 'Metrics incorrectly count skipped results as failures; fixed oracle remains unchanged.'
                 (self.report / 'demo-seed.patch').write_text(git(workspace, 'diff', base) + '\n')
-            previous = None
-            for number in range(self.args.max_cycles + 1):
-                focused = [r['id'] for r in previous['results'] if r['status'] == 'failed' and r['id'].startswith('tests/') and '.py::' in r['id']] if previous else []
-                cycle = self.suite(workspace, number, focused)
-                failed = sorted(r['id'] for r in cycle['results'] if r['status'] == 'failed')
-                cycle['failure_signature'] = hashlib.sha256(json.dumps(failed).encode()).hexdigest()
-                if not failed:
-                    if self.args.demo and not previous:
-                        raise Intervention('Demo seed did not produce the required failing regression')
-                    if previous and cycle.get('focused_exit_code'):
-                        raise Intervention('Focused rerun failed despite passing regression; inconsistent evidence')
-                    if base:
-                        patch = self.validate_diff(workspace, base)
-                        (self.report / 'repair.patch').write_text(sanitize(patch) + '\n')
-                        if (original is not None and original != source_fingerprint(ROOT)) or source_manifest(ROOT) != manifest:
-                            raise Intervention('Original checkout changed during repair; no changes applied')
-                        if patch and not self.args.demo:
-                            ensure_writer(ROOT)
-                            check = subprocess.run(['git', 'apply', '--check', '-'], cwd=ROOT, input=patch+'\n', text=True, capture_output=True)
-                            if check.returncode:
-                                raise Intervention('Patch conflicts with original checkout; no changes applied')
-                            subprocess.run(['git', 'apply', '-'], cwd=ROOT, input=patch+'\n', text=True, check=True)
-                            manifest = source_manifest(ROOT)
-                            self.data['repair_applied'] = True
-                        # The worktree/branch and reports remain available; never reset/check out user work.
-                    if source_manifest(ROOT) != manifest:
-                        raise Intervention('Source changed during validation; reports describe the frozen snapshot, rerun for the current source')
-                    self.data.update(status='passed', stop_reason='All executed checks passed')
-                    return 0
+            def stable():
+                if (original is not None and original != source_fingerprint(ROOT)) or source_manifest(ROOT) != manifest:
+                    raise Intervention('Original checkout changed; stop before retest/apply')
+
+            baseline = self.suite(workspace, 0, stage='baseline')
+            if failure_count(baseline['results']):
                 if self.args.report_only:
                     self.data.update(status='failed', stop_reason='Report-only run; repairs disabled')
                     return 1
-                if previous:
-                    if cycle['failure_signature'] == previous['failure_signature']:
-                        raise Halt('Repeated identical failures')
-                    if failure_count(cycle['results']) >= failure_count(previous['results']):
-                        raise Halt('No measurable improvement in failing test count')
-                    if set(failed) - {r['id'] for r in previous['results'] if r['status'] == 'failed'}:
-                        raise Halt('Repair introduced new regression failures')
-                if number >= self.args.max_cycles:
-                    raise Halt('Maximum repair cycles reached')
-                # Validate before testing too, so a worker cannot silently change its oracle.
-                previous = cycle
-                pre_worker = git(workspace, 'diff', '--binary', base)
-                tracked = git(workspace, 'ls-files', '-z').split('\0')
-                before_files = {name: (workspace/name).read_text(errors='replace') for name in tracked if name and (workspace/name).is_file() and not (workspace/name).is_symlink() and (workspace/name).suffix in {'.py','.ts','.tsx','.css'}}
-                self.repair(workspace, cycle, number + 1)
-                self.validate_diff(workspace, base)
-                import difflib
-                worker_patch = ''.join(''.join(difflib.unified_diff(content.splitlines(True), (workspace/name).read_text().splitlines(True), fromfile='a/'+name, tofile='b/'+name)) for name,content in before_files.items() if (workspace/name).read_text(errors='replace') != content)
-                patch_file = self.report / f'worker-{number+1}.patch'
-                patch_file.write_text(sanitize(worker_patch))
-                patch_file.chmod(0o600)
-                if git(workspace, 'diff', '--binary', base) == pre_worker:
-                    raise Halt('Worker made no measurable source change')
-                if (original is not None and original != source_fingerprint(ROOT)) or source_manifest(ROOT) != manifest:
-                    raise Intervention('Original checkout changed; stop before retest/apply')
-            return 1
+                self.repair_groups(workspace, baseline, base, stable)
+            elif self.args.demo:
+                raise Intervention('Demo seed did not produce the required failing regression')
+            if base:
+                patch = self.validate_diff(workspace, base)
+                (self.report / 'repair.patch').write_text(sanitize(patch) + '\n')
+                stable()
+                if patch and not self.args.demo:
+                    ensure_writer(ROOT)
+                    check = subprocess.run(['git', 'apply', '--check', '-'], cwd=ROOT, input=patch+'\n', text=True, capture_output=True)
+                    if check.returncode:
+                        raise Intervention('Patch conflicts with original checkout; no changes applied')
+                    subprocess.run(['git', 'apply', '-'], cwd=ROOT, input=patch+'\n', text=True, check=True)
+                    manifest = source_manifest(ROOT)
+                    self.data['repair_applied'] = True
+            if source_manifest(ROOT) != manifest:
+                raise Intervention('Source changed during validation; reports describe the frozen snapshot, rerun for the current source')
+            for group in self.data['failure_groups']:
+                group['result'] = 'accepted'
+            for repair in self.data['repairs']:
+                if repair['result'] == 'focused_and_subsystem_passed':
+                    repair['result'] = 'accepted'
+            self.data.update(status='passed', stop_reason='All executed checks passed')
+            return 0
         finally:
+            for repair in self.data['repairs']:
+                if repair['result'] in {'awaiting_validation', 'focused_and_subsystem_passed'}:
+                    repair['result'] = 'not_accepted'
+            for group in self.data['failure_groups']:
+                if group.get('result') == 'pending_regression':
+                    group['result'] = 'not_accepted'
             owner.unlink(missing_ok=True)
             self.stopfile.unlink(missing_ok=True)
             lock.close()
@@ -621,7 +829,8 @@ def main():
     parser.add_argument('--budget-seconds', type=int, default=900)
     parser.add_argument('--worker-seconds', type=int, default=180)
     parser.add_argument('--probe-seconds', type=int, default=180)
-    parser.add_argument('--max-worker-tokens', type=int, default=100000)
+    parser.add_argument('--max-worker-tokens', type=int, default=30000)
+    parser.add_argument('--worker-reasoning', choices=('medium', 'high'), default='medium', help='Initial reasoning; second attempt always uses high')
     parser.add_argument('--max-report-mb', type=int, default=64)
     parser.add_argument('--max-log-kb', type=int, default=1024)
     args = parser.parse_args()

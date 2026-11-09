@@ -6,6 +6,12 @@ import pytest
 from scripts.qa_support import write_json
 
 
+def pytest_collection_modifyitems(items):
+    # Preserve class and parametrization syntax exactly; JUnit classname is lossy.
+    for item in items:
+        item.user_properties.append(('qa_nodeid', item.nodeid))
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
     yield
