@@ -70,7 +70,27 @@ flowchart LR
 ```
 
 The policy engine enforces scope, budgets and tool limits independently of the model's instructions. Backend restarts revoke active lab scopes.
+## Installation
 
+**BlackBox** is built for Linux, with first-class support for Omarchy.
+
+### One-line install
+
+```bash
+git clone https://github.com/arnav42069/Blackbox.git && cd Blackbox && ./scripts/install_omarchy.sh
+```
+
+### Launch BlackBox
+
+```bash
+~/.local/bin/blackbox
+```
+
+Open the secure local pairing link printed in your terminal.
+
+**Requirements:** Linux, Python 3.12+, Node.js, npm, Git and a running [Ollama](https://ollama.com/) instance.
+
+> BlackBox runs locally. No cloud API key is required when using locally installed Ollama models.
 ## Quick start
 
 **Prerequisites:** Linux (Omarchy/Arch is the primary target), Python 3.12+, Node.js/npm and an installed Ollama service.
