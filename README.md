@@ -39,36 +39,6 @@ BlackBox is a local Ollama chat workbench for security learning and **explicitly
 | **Durable sessions** | Persist chat history, exports and evidence locally with configurable retention. |
 | **Persistent QA** | Run deterministic checks and optional bounded repair cycles in isolated Git worktrees. |
 
-## Screenshot and scan workflows
-
-Authorize your exact local/lab target and ports in **Scope**, then upload a terminal,
-web-app, scan, error or diagram screenshot. “Read this screenshot” produces quoted
-structured observations, uncertainty and inferred URL candidates. A text-only chat
-model can use an installed vision fallback configured in **Settings**; unsupported
-images are rejected without losing your draft.
-
-After an image or scan identifies HTTP on a nonstandard port, “Fuzz the web server”
-reuses that endpoint and selects bounded ffuf discovery. **Live Activity** shows the
-typed plan, why the tool was chosen, actual argv, response codes and cache reuse.
-Fresh complete scans are reused by default (15 minutes); “rescan” or “ignore cache”
-forces execution. Stale, failed and incomplete outputs stay explicitly labelled.
-Multiple matching URLs require an exact target; an IP address does not imply SSH.
-
-Existing Nmap XML, ffuf JSON and terminal exports can be parsed from the private
-workspace through `scan.parse` with their original observation timestamp (unknown
-time is treated as stale);
-`scan.lookup` analyzes scoped saved findings without starting another scan.
-
-Run the controlled demo (no public targets):
-
-```bash
-.venv/bin/python scripts/demo_orchestration.py --output qa-reports/orchestration-demo
-```
-
-The demo generates a scan screenshot, mocks vision transcription, and uses real
-ffuf against a loopback HTTP fixture. It saves the plans, argv, observations, HTTP
-codes and cache trace. See [the implementation report](docs/orchestration-report.md).
-
 ## Interface
 
 ```text
@@ -149,29 +119,6 @@ blackbox --model qwen3.5:4b
 ```
 
 You can select other installed models from the app's model menu. Verify vision and tool capability in **Settings → Probe vision + tools** before relying on either capability. BlackBox never silently downloads a model.
-
-### Stop or restart BlackBox
-
-```bash
-blackbox kill
-blackbox restart
-blackbox restart --model huihui_ai/qwen3.5-abliterated:4b
-```
-
-These commands work from any directory. Stop uses SIGTERM and escalates to SIGKILL
-after three seconds. Restart preserves the startup model, port and data/config
-settings, launches the latest already-installed code and prints a new pairing URL.
-Every previous scope attestation is revoked. No Git pull, installation or rebuild
-runs automatically. With no running instance, restart behaves like normal foreground
-startup. With multiple instances, select one using `--data-dir /absolute/path` (or
-`BLACKBOX_DATA_DIR`); unrelated services are never selected by a name substring.
-The backend holds `server.lock`; lifecycle commands use a separate `lifecycle.lock`
-and can shut down a verified backend while its instance lock remains held. Busy
-lifecycle operations report their owner after a bounded wait. Lock files are never
-deleted to bypass an active owner.
-
-See [process management](docs/cli-process-management.md) for identity verification,
-private logs, supported launchers and asset refresh requirements.
 
 ### Development server
 
@@ -260,57 +207,3 @@ Reports and locally collected evidence are written under `qa-reports/` (ignored 
 Built for authorized research, practice environments and repeatable testing.
 
 </div>
-
-
-### Arch/Omarchy dependency tiers
-
-For the complete baseline toolset install `iputils`, `nmap`, and `openssh`:
-
-```bash
-sudo pacman -S --needed iputils nmap openssh
-```
-
-`ffuf` is preferred for HTTP content discovery. Without it, BlackBox uses its
-bounded native HTTP adapter with the same scope, request budget, rate and timeout.
-`whatweb` is optional: missing fingerprinting falls back to HTTP headers with an
-explicit limitation. `grim` and `wl-clipboard` are optional native Wayland capture
-utilities; browser image upload, drag/drop and image paste do not require them.
-
-Startup, `blackbox doctor`, and the UI dependency details report missing packages,
-affected capabilities and Arch installation commands. Missing baseline tools disable
-their capabilities while the UI and other available tools remain usable. Restart
-after installing native tools to refresh the startup inventory. Missing HTTP tools
-never select SSH. No automatic package installation or model call is involved in
-these checks. The QA orchestrator and its token budgeting remain unchanged.
-
-### Persistent room and flag goals
-
-For an explicitly authorized room/flag goal, BlackBox retrieves existing evidence,
-identifies missing service prerequisites and performs permitted HTTP discovery
-before considering configured read-only SFTP. Missing SSH credentials limit that
-tool; they do not block all discovery. Goal actions and observations appear in
-Activity. At a run limit, progress is saved: send **Continue task** to authorize
-one further bounded run under the current scope. Cancellation/restart never resumes
-work automatically. See [goal orchestration](docs/goal-orchestration.md) for behavior,
-regression coverage and limits; a retrieved candidate does not prove room acceptance.
-See the [autonomous room workflow](docs/autonomous-room-workflow.md) for exact-target
-management, adaptive discovery, home-directory completion criteria and Continue goal.
-
-### Streaming conversation
-
-Assistant replies stream into the chat with Markdown/code/table rendering, copy
-controls, a generation cursor and clear execution states. Tool intentions and
-observed results appear as collapsible progress; full raw evidence stays in Activity.
-Scrolling follows new output until you scroll upward. Stop retains partial text,
-and Retry starts another bounded run. A missing/empty/failed model response or budget
-limit produces an explicit saved answer/blocker rather than silently returning idle.
-
-See [conversation diagnostics and verification](docs/conversation-streaming.md) for
-the event contract, live Ollama check, snapshot/reconnect fixes and exact tests.
-The [installed-model response investigation](docs/ollama-response-repair.md) covers
-separate thinking/content/tool fields, visible terminal errors, and opt-in live
-conversation plus scoped local HTTP acceptance tests. Older backend protocols now
-produce a visible restart warning.
-Tool failures now return [typed recovery guidance](docs/tool-argument-recovery.md).
-Safe argument repairs remain schema/policy checked; identical failed operations
-are suppressed so the planner can select a different valid action.
