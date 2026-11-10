@@ -4,8 +4,10 @@ import os
 from itertools import islice
 import re
 from pathlib import Path, PurePosixPath
+from contextlib import contextmanager
+import stat
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from .base import Arguments, ToolResult
 from ..storage.files import clean_text
@@ -33,11 +35,56 @@ def local_path(root: Path, value: str) -> Path:
     return result
 
 
+def normalize_path(root: Path,value: str) -> str:
+    """Only exact workspace-contained absolute paths have a safe relative repair."""
+    if not value or '..' in PurePosixPath(value).parts or value.startswith('~') or '://' in value:
+        raise ValueError('Workspace paths must be relative, without traversal. List the workspace and use an exact returned relative path.')
+    if Path(value).is_absolute():
+        try:
+            value=str(Path(value).relative_to(root.absolute()))
+        except ValueError:
+            raise ValueError('Absolute paths outside the configured workspace are forbidden. workspace.read cannot read a remote host; use workspace.list to identify local relative paths.') from None
+    safe_parts(value)
+    return str(PurePosixPath(value))
+
+
+@contextmanager
+def open_local(root,value,*,directory=False):
+    """Resolve confinement, then walk pinned descriptors without following races."""
+    path=local_path(root,value)
+    relative=path.relative_to(root.resolve()).parts
+    descriptors=[]
+    try:
+        fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        descriptors.append(fd)
+        for i,part in enumerate(relative):
+            flags=os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK
+            if i<len(relative)-1 or directory:
+                flags|=os.O_DIRECTORY
+            fd=os.open(part,flags,dir_fd=fd)
+            descriptors.append(fd)
+        if not directory and not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise IsADirectoryError('workspace.read requires a regular file; list the workspace and select a file.')
+        yield fd
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
 class LocalPath(Arguments):
-    path: str = Field(default='.', max_length=512)
+    path: str = Field(default='.', min_length=1,max_length=512,description='Relative to the application workspace, never the remote host. No traversal, credentials, or symlink escape. Use workspace.list first.',examples=['.','reports/scan.xml'])
+
+    @field_validator('path')
+    @classmethod
+    def relative_path(cls,value):
+        safe_parts(value)
+        if Path(value).is_absolute() or '..' in PurePosixPath(value).parts or value.startswith('~') or '://' in value:
+            raise ValueError('Workspace paths must be relative, without traversal')
+        return str(PurePosixPath(value))
 
 
 class Read(LocalPath):
+    path: str = Field(min_length=1,max_length=512,description='Exact relative file path returned by workspace.list/search. Not a remote /home path.',examples=['notes.txt'])
     max_bytes: int = Field(default=8192, ge=1, le=32768)
 
 
@@ -47,28 +94,29 @@ class Search(LocalPath):
 
 
 async def list_dir(ctx, args):
-    path = local_path(ctx.settings.data_dir / 'workspace', args.path)
     entries = []
-    for p in sorted(islice(path.iterdir(), 200)):
-        try:
-            local_path(ctx.settings.data_dir / 'workspace', str(p.relative_to(ctx.settings.data_dir / 'workspace')))
-            entries.append({'name': p.name, 'directory': p.is_dir()})
-        except ValueError:
-            continue
+    with open_local(ctx.settings.data_dir/'workspace',args.path,directory=True) as fd:
+        with os.scandir(fd) as listing:
+            for p in sorted(islice(listing,200),key=lambda entry:entry.name):
+                try:
+                    safe_parts(p.name)
+                    if not p.is_symlink():
+                        entries.append({'name':p.name,'path':str(PurePosixPath(args.path)/p.name),'directory':p.is_dir(follow_symlinks=False)})
+                except ValueError:
+                    continue
     return ToolResult(ok=True, evidence=entries, summary=f'{len(entries)} workspace entries')
 
 
 async def read(ctx, args):
-    p = local_path(ctx.settings.data_dir / 'workspace', args.path)
-    if not p.is_file():
-        raise ValueError('Not a regular workspace file')
-    with p.open('rb') as f:
-        data = f.read(args.max_bytes + 1)
+    with open_local(ctx.settings.data_dir/'workspace',args.path) as fd:
+        data=os.read(fd,args.max_bytes+1)
     return ToolResult(ok=True, stdout=clean_text(data[:args.max_bytes].decode(errors='replace')), truncated=len(data)>args.max_bytes, evidence=[{'path': args.path}])
 
 
 async def search(ctx, args):
     root = local_path(ctx.settings.data_dir / 'workspace', args.path)
+    if not root.is_dir():
+        raise NotADirectoryError('workspace.search requires an existing workspace directory')
     result, inspected = [], 0
     for current, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = [d for d in sorted(dirs) if not d.startswith('.') and not (Path(current)/d).is_symlink()][:50]
@@ -83,8 +131,8 @@ async def search(ctx, args):
                 p = local_path(ctx.settings.data_dir / 'workspace', rel)
                 if p.is_symlink() or not p.is_file():
                     continue
-                with p.open('rb') as f:
-                    text = f.read(32768).decode(errors='replace')
+                with open_local(ctx.settings.data_dir/'workspace',rel) as fd:
+                    text=os.read(fd,32768).decode(errors='replace')
                 for i, line in enumerate(text.splitlines()):
                     if args.pattern.lower() in line.lower():
                         result.append({'path': rel, 'line': i+1, 'text': clean_text(line[:300])})

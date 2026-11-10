@@ -9,3 +9,10 @@ max_turns: 12
 max_wall_seconds: 300
 retention_days: 30
 visual_effects: false
+
+# Installed model used only when the selected chat model lacks vision.
+vision_model: null
+scan_freshness_seconds: 900
+http_rate: 2
+http_concurrency: 1
+discovery_timeout_seconds: 40

@@ -69,3 +69,21 @@ label.field {display:flex; flex-direction:column; gap:6px; margin:12px 0; color:
 /* Preserve the upstream error red while keeping small error text above AA contrast. */
 .banner.error {background:var(--surface-1);}
 .stop:hover:not(:disabled) {background:var(--surface-1);border-color:var(--bt-red);color:var(--bt-red);}
+.message.assistant {padding:16px; border-left:2px solid var(--bt-accent); background:var(--surface-0); min-width:0;}
+.conversation-progress {padding:8px 12px; color:var(--text-secondary); border-left:1px solid var(--border); font-size:12px;}
+.conversation-progress summary {cursor:pointer; overflow-wrap:anywhere;}
+.generating {display:flex;gap:8px;align-items:center;color:var(--bt-accent);font:12px var(--mono);padding:12px;}
+.stream-cursor {color:var(--bt-cursor);animation:blink 1s steps(2) infinite;}
+.copy-message,.copy-code {font-size:10px;padding:3px 6px;}
+.copy-message {margin:6px 8px 6px 0;}
+.code-block {position:relative;border:1px solid var(--border);padding:8px;margin:8px 0;}
+.code-block .copy-code {float:right;}
+.code-block small {color:var(--text-secondary);}
+.syntax-keyword {color:var(--bt-accent);}
+.syntax-string {color:var(--bt-green);}
+.syntax-number {color:var(--bt-cursor);}
+.syntax-comment {color:var(--text-secondary);font-style:italic;}
+.markdown {overflow-wrap:anywhere;overflow-x:auto;}
+.markdown table {border-collapse:collapse;display:block;overflow:auto;}
+.markdown th,.markdown td {border:1px solid var(--border);padding:6px 10px;text-align:left;}
+@media(prefers-reduced-motion:reduce){.stream-cursor,.caret.active{animation:none;}}

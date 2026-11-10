@@ -45,6 +45,8 @@ def create_app(settings: Settings | None = None, transport=None):
     auth = Auth()
     ollama = OllamaClient(settings, db, transport)
     agent = Agent(settings, db, ollama)
+    from .dependencies import detect
+    dependencies = detect()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -56,6 +58,7 @@ def create_app(settings: Settings | None = None, transport=None):
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings, app.state.db, app.state.auth = settings, db, auth
     app.state.ollama, app.state.agent = ollama, agent
+    app.state.dependencies = dependencies
     app.add_middleware(SecurityMiddleware, auth=auth, port=settings.port)
 
     @app.exception_handler(HTTPException)
@@ -115,7 +118,7 @@ def create_app(settings: Settings | None = None, transport=None):
             state = {"connected": True, "models": len(models), "message": "Connected" if models else "No models installed. Run ollama pull qwen3.5:4b"}
         except OllamaError as e:
             state = {"connected": False, "message": str(e)}
-        return {"ollama": state, "binaries": {name: bool(shutil.which(name)) for name in ("ping", "nmap", "curl", "whatweb", "ffuf", "ssh", "grim", "wl-paste")}, "ssh_agent": bool(__import__("os").environ.get("SSH_AUTH_SOCK")), "storage": "private", "port": settings.port}
+        return {"conversation_protocol": 1, "ollama": state, "dependencies": dependencies, "binaries": {name: bool(shutil.which(name)) for name in ("ping", "nmap", "curl", "whatweb", "ffuf", "ssh", "grim", "wl-paste")}, "ssh_agent": bool(__import__("os").environ.get("SSH_AUTH_SOCK")), "storage": "private", "port": settings.port}
 
     @app.get("/api/models")
     async def models():
@@ -135,7 +138,9 @@ def create_app(settings: Settings | None = None, transport=None):
 
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
-        return {**session(sid), "messages": db.messages(sid), "events": db.events(sid)}
+        from .core.goals import GoalController
+        goal = GoalController.load(db, sid)
+        return {**session(sid), 'task_goal':goal.model_dump() if goal else None, "messages": db.messages(sid), "events": db.events(sid)}
 
     @app.patch("/api/sessions/{sid}")
     async def update_session(sid: str, body: NewSession):
@@ -159,7 +164,25 @@ def create_app(settings: Settings | None = None, transport=None):
         except (ValueError, OSError) as e:
             raise HTTPException(400, str(e))
         idle(sid)
+        previous=session(sid).get('scope') or {}
         db.execute("UPDATE sessions SET scope_json=? WHERE id=?", (json.dumps(approved), sid))
+        if previous and previous!=approved:
+            from .core.goals import GoalController
+            goal=GoalController.load(db,sid)
+            db.event(sid,None,'target_context_changed',{'previous_targets':previous.get('allowed_targets',[]),'targets':approved['allowed_targets'],'reason':'Authorization changed. Prior findings remain historical and must not be assumed current.'})
+            if goal:
+                goal.status='needs_access'
+                goal.result=None
+                goal.pending=None
+                goal.pending_steps=[]
+                goal.attempts={}
+                goal.hypotheses=[]
+                goal.verified_findings=[]
+                goal.candidates=[]
+                goal.remote_files=[]
+                goal.scope_key=''
+                goal.checkpoint={'reason':'Scope changed; confirm the exact target before continuing.','at':now()}
+                db.execute('UPDATE task_goals SET payload_json=?,updated_at=? WHERE session_id=?',(goal.model_dump_json(),now(),sid))
         return session(sid)
 
     @app.post("/api/sessions/{sid}/approvals/{tid}")
@@ -182,8 +205,11 @@ def create_app(settings: Settings | None = None, transport=None):
             if (not text and not uploads) or len(text) > 16000:
                 raise HTTPException(400, "Provide a message or images (maximum 16000 characters)")
             cap = await ollama.capabilities(session(sid)["model"])
-            if uploads and not cap['vision']:
-                raise HTTPException(400, "Vision unsupported or unverified. Select/probe a vision-capable model; your draft is preserved.")
+            if uploads:
+                try:
+                    await ollama.vision_model(session(sid)['model'])
+                except OllamaError as e:
+                    raise HTTPException(400, str(e))
             for upload in uploads:
                 if not hasattr(upload, 'read'):
                     raise HTTPException(400, "Images must be multipart file uploads")
@@ -200,8 +226,9 @@ def create_app(settings: Settings | None = None, transport=None):
             with db.transaction():
                 for image in normalized:
                     stored.append(images.store(settings, db, sid, image))
-                db.message(sid, "user", text, attachments=[a[0] for a in stored])
+                mid = db.message(sid, "user", text, attachments=[a[0] for a in stored])
                 db.execute("INSERT INTO runs VALUES (?,?,?,NULL,'running','{}','{}')", (rid, sid, now()))
+                db.event(sid, rid, 'user_message', {'message_id':mid, 'content':text, 'attachment_ids':[a[0] for a in stored], 'metadata':{}})
                 db.execute("UPDATE sessions SET title=CASE WHEN title='New session' THEN ? ELSE title END,status='running' WHERE id=?", ((text or 'Image analysis')[:64], sid))
         except BaseException:
             for _, path in stored:
@@ -218,13 +245,17 @@ def create_app(settings: Settings | None = None, transport=None):
             raise HTTPException(400, 'No message to retry')
         last = users[-1]
         cap = await ollama.capabilities(session(sid)['model'])
-        if last['attachment_ids'] and not cap['vision']:
-            raise HTTPException(400, 'Select/probe a vision-capable model before retrying this image message')
+        if last['attachment_ids']:
+            try:
+                await ollama.vision_model(session(sid)['model'])
+            except OllamaError as e:
+                raise HTTPException(400, str(e))
         idle(sid)
         rid = uid()
         with db.transaction():
-            db.message(sid, 'user', last['content'], attachments=last['attachment_ids'])
+            mid = db.message(sid, 'user', last['content'], attachments=last['attachment_ids'])
             db.execute("INSERT INTO runs VALUES (?,?,?,NULL,'running','{}','{}')", (rid, sid, now()))
+            db.event(sid, rid, 'user_message', {'message_id':mid, 'content':last['content'], 'attachment_ids':last['attachment_ids'], 'metadata':{}})
             db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
         agent.start(sid, rid)
         return {'run_id': rid}
@@ -252,13 +283,17 @@ def create_app(settings: Settings | None = None, transport=None):
             raise HTTPException(400, "Invalid event cursor")
         async def stream():
             cursor = after
+            earliest = db.one('SELECT MIN(id) AS first FROM event_journal WHERE session_id=?', (sid,))['first']
+            if after and earliest and after < earliest - 1:
+                # A retained snapshot repairs clients older than the bounded journal.
+                yield 'data: ' + json.dumps({'type': 'resync_required', 'event_id': earliest - 1}) + '\n\n'
             while not await request.is_disconnected():
                 for event in db.events(sid, cursor):
                     cursor = event["event_id"]
                     yield f"id: {cursor}\ndata: {json.dumps(event)}\n\n"
                 yield ": heartbeat\n\n"
                 await asyncio.sleep(0.25)
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
     @app.post("/api/sessions/{sid}/cancel")
     async def cancel(sid: str):

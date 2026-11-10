@@ -61,6 +61,7 @@ async def test_actual_http_pinned_redirect_and_budget(context,web_server):
 
 async def test_discovery_bounded(context,web_server):
     port,requests=web_server
+    context.settings.prefs.http_rate=5
     result=await execute(context,'web.discover_paths',url=f'http://127.0.0.1:{port}',rate=5)
     assert result.ok and len(requests)==12
     context.scope.data['allow_active_scanning']=False

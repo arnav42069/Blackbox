@@ -39,6 +39,23 @@ def hostname(value: str) -> str:
         return value.lower()
 
 
+def port_expression(values):
+    """Compact bounded port arguments without changing their meaning."""
+    values=sorted(set(values))
+    if not values:
+        return ''
+    groups=[]
+    start=end=values[0]
+    for value in values[1:]:
+        if value==end+1:
+            end=value
+        else:
+            groups.append(str(start) if start==end else f'{start}-{end}')
+            start=end=value
+    groups.append(str(start) if start==end else f'{start}-{end}')
+    return ','.join(groups)
+
+
 async def resolve(host: str) -> list[str]:
     import asyncio
     try:

@@ -24,3 +24,16 @@ test('ordinary clipboard text remains normal',async({page})=>{
   });
   expect(prevented).toBe(false);
 });
+
+test('screenshot-only request shows structured observations and inspectable plan',async({page})=>{
+  await page.setViewportSize({width:1440,height:900});
+  await page.locator('input[type=file]').setInputFiles({name:'scan.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhWQAAAAASUVORK5CYII=','base64')});
+  await page.getByLabel('Message',{exact:true}).fill('Read this screenshot');
+  await page.getByRole('button',{name:'RUN',exact:true}).click();
+  await expect(page.locator('.message.assistant')).toContainText('Visual observations (not independently verified');
+  await page.getByText('Inspect execution plan',{exact:true}).click();
+  await expect(page.locator('.activity-log')).toContainText('"intent": "image"');
+  await page.getByText('Inspect image observations',{exact:true}).click();
+  await expect(page.locator('.activity-log')).toContainText('"visible_text": "red square"');
+  await expect(page.locator('.tool-card')).toHaveCount(0);
+});

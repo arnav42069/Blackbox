@@ -5,7 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 import httpx
-from pydantic import Field
+from pydantic import Field,field_validator
 from typing import Literal
 
 from .base import Arguments, ToolResult
@@ -17,8 +17,14 @@ WORDLISTS = {'small': ['', 'robots.txt', 'sitemap.xml', 'index.html', 'admin', '
 
 
 class Inspect(Arguments):
-    url: str = Field(max_length=2048)
-    method: Literal['GET', 'HEAD'] = 'GET'
+    url: str = Field(max_length=2048,description='Explicit HTTP(S) URL with scheme, authorized host and port. No credentials/fragments. Use observed endpoints; never assume SSH.')
+    method: Literal['GET', 'HEAD'] = Field(default='GET',description='GET reads a bounded body; HEAD reads headers only')
+
+    @field_validator('url')
+    @classmethod
+    def valid_url(cls,value):
+        parse_url(value)
+        return value
 
 
 class Discover(Arguments):
@@ -26,6 +32,8 @@ class Discover(Arguments):
     wordlist: Literal['small'] = 'small'
     rate: int = Field(default=2, ge=1, le=5)
     concurrency: int = Field(default=1, ge=1, le=2)
+    timeout_seconds: int = Field(default=40, ge=1, le=40)
+    rescan: bool = False
 
 
 def parse_url(value):
@@ -45,6 +53,8 @@ async def fetch(ctx, value, method='GET', redirect_limit=3, follow=True):
     async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=8) as client:
         for redirect in range(redirect_limit + 1):
             u, port = parse_url(value)
+            if ctx.run_target and u.hostname!=ctx.run_target:
+                raise ScopeDenied('Redirect destination differs from this run’s exact target')
             ip = await ctx.scope.destination(u.hostname, port)
             ctx.request()
             numeric = f'[{ip}]' if ':' in ip else ip
@@ -53,7 +63,7 @@ async def fetch(ctx, value, method='GET', redirect_limit=3, follow=True):
             if port != (443 if u.scheme == 'https' else 80):
                 host += f':{port}'
             async with client.stream(method, url, headers={'Host': host, 'User-Agent': 'BlackBox/0.1'}, extensions={'sni_hostname': u.hostname}) as response:
-                record = {'url': clean_text(value), 'destination': ip, 'status': response.status_code, 'content_type': response.headers.get('content-type', '')}
+                record = {'kind':'endpoint', 'target':u.hostname, 'port':port, 'protocol':u.scheme, 'url': clean_text(value), 'destination': ip, 'status': response.status_code, 'content_type': response.headers.get('content-type', ''), 'headers': dict(response.headers)}
                 evidence.append(record)
                 if follow and response.status_code in {301, 302, 303, 307, 308} and response.headers.get('location'):
                     if redirect == redirect_limit:
@@ -70,7 +80,54 @@ async def fetch(ctx, value, method='GET', redirect_limit=3, follow=True):
 
 
 async def inspect(ctx, args):
-    return await fetch(ctx, args.url, args.method)
+    if args.method != 'HEAD' or not ctx.runner.binaries.get('curl'):
+        return await fetch(ctx, args.url, args.method)
+    u, port = parse_url(args.url)
+    ip = await ctx.scope.destination(u.hostname, port)
+    ctx.request()
+    address = f'[{ip}]' if ':' in ip else ip
+    result = await ctx.runner.run('curl', ['--disable', '--noproxy', '*', '--silent', '--show-error', '--head', '--max-time', '8', '--max-redirs', '0', '--resolve', f'{u.hostname}:{port}:{address}', '--', args.url], timeout=10, on_output=ctx.output, on_command=ctx.command)
+    if result.ok:
+        import re
+        statuses = re.findall(r'^HTTP/\S+\s+(\d{3})', result.stdout, re.M)
+        if not statuses:
+            result.ok, result.summary = False, 'curl returned no HTTP status'
+        else:
+            result.evidence = [{'kind':'endpoint', 'target':u.hostname, 'port':port, 'protocol':u.scheme, 'url':args.url, 'destination':ip, 'status':int(statuses[-1]), 'headers':result.stdout}]
+            result.summary = f'HTTP {statuses[-1]} headers inspected by curl; redirects not followed'
+    return result
+
+
+async def technologies(ctx, args):
+    u, port = parse_url(args.url)
+    if u.scheme != 'http':
+        raise ValueError('WhatWeb is restricted to pinned HTTP; use web.inspect for verified HTTPS headers')
+    ip = await ctx.scope.destination(u.hostname, port)
+    ctx.request()
+    numeric = f'[{ip}]' if ':' in ip else ip
+    url = urlunsplit(('http', f'{numeric}:{port}', u.path or '/', u.query, ''))
+    result = await ctx.runner.run('whatweb', ['--aggression=1', '--max-redirects=0', '--follow-redirect=never', '--open-timeout=5', '--read-timeout=5', '--header', f'Host: {u.netloc}', '--', url], timeout=15, on_output=ctx.output, on_command=ctx.command)
+    if result.ok:
+        result.evidence = [{'url':args.url, 'destination':ip, 'technologies_output':result.stdout}]
+    return result
+
+
+async def tls(ctx, args):
+    u, port = parse_url(args.url)
+    if u.scheme != 'https':
+        raise ValueError('TLS inspection requires an explicit HTTPS endpoint')
+    ip = await ctx.scope.destination(u.hostname, port)
+    numeric = f'[{ip}]' if ':' in ip else ip
+    import ipaddress
+    try:
+        ipaddress.ip_address(u.hostname)
+        verify = '-verify_ip'
+    except ValueError:
+        verify = '-verify_hostname'
+    result = await ctx.runner.run('openssl', ['s_client', '-connect', f'{numeric}:{port}', '-servername', u.hostname, verify, u.hostname, '-verify_return_error', '-brief', '-no_ign_eof'], timeout=12, on_output=ctx.output, on_command=ctx.command)
+    if result.ok:
+        result.evidence = [{'url':args.url, 'destination':ip, 'tls_output':result.stdout + result.stderr}]
+    return result
 
 
 async def discover(ctx, args):
@@ -79,15 +136,20 @@ async def discover(ctx, args):
     await ctx.scope.destination(u.hostname, port)
     if 'FUZZ' in args.url:
         raise ValueError('URL must not contain fuzz substitution keywords')
+    words = WORDLISTS[args.wordlist]
+    if len(words) > ctx.scope.data['max_requests_per_run'] - ctx.requests:
+        raise ScopeDenied('Insufficient request budget for the curated wordlist')
     # Native HTTPS adapter keeps certificate verification; ffuf's transport skips TLS verification.
-    if u.scheme == 'https':
+    if u.scheme == 'https' or not ctx.runner.binaries.get('ffuf'):
         results = []
-        for path in WORDLISTS[args.wordlist]:
-            result = await fetch(ctx, args.url.rstrip('/') + '/' + path, follow=False)
-            results.extend(result.evidence)
-            ctx.output('stdout', f'{result.evidence[-1]["status"]} {path or "/"}\n')
-            await asyncio.sleep(1/args.rate)
-        return ToolResult(ok=True, evidence=results, summary=f'{len(results)} public HTTPS paths checked with verified TLS')
+        reason = 'verified TLS' if u.scheme == 'https' else 'ffuf unavailable; native HTTP fallback'
+        async with asyncio.timeout(args.timeout_seconds):
+            for path in WORDLISTS[args.wordlist]:
+                result = await fetch(ctx, args.url.rstrip('/') + '/' + path, follow=False)
+                results.extend(result.evidence)
+                ctx.output('stdout', f'{result.evidence[-1]["status"]} {path or "/"}\n')
+                await asyncio.sleep(1/args.rate)
+        return ToolResult(ok=True, evidence=results, summary=f'{len(results)} public paths checked with native HTTP adapter ({reason}); redirects not followed')
     ip = await ctx.scope.destination(u.hostname, port)
     words = [path or '.' for path in WORDLISTS[args.wordlist]]
     if len(words) > ctx.scope.data['max_requests_per_run'] - ctx.requests:
@@ -103,18 +165,22 @@ async def discover(ctx, args):
         wordlist = Path(directory)/'paths.txt'
         wordlist.write_text('\n'.join(words)+'\n')
         # Empty HOME/XDG directories prevent implicit ffufrc settings, proxies or input commands.
-        result = await ctx.runner.run('ffuf', ['-config', '/dev/null', '-u', url, '-H', f'Host: {host}', '-w', str(wordlist), '-t', str(args.concurrency), '-rate', str(args.rate), '-maxtime', '40', '-timeout', '5', '-mc', 'all', '-noninteractive', '-ignore-body', '-s', '-json'], timeout=45, on_output=ctx.output, on_command=ctx.command, config_home=directory)
-    records = []
-    for line in result.stdout.splitlines():
-        try:
-            record = json.loads(line)
-            records.append({'url': record.get('url'), 'status': record.get('status'), 'destination': ip})
-        except ValueError:
-            continue
+        result = await ctx.runner.run('ffuf', ['-config', '/dev/null', '-u', url, '-H', f'Host: {host}', '-w', str(wordlist), '-t', str(args.concurrency), '-rate', str(args.rate), '-maxtime', str(args.timeout_seconds), '-timeout', '5', '-mc', 'all', '-noninteractive', '-ignore-body', '-s', '-json'], timeout=args.timeout_seconds+2, on_output=ctx.output, on_command=ctx.command, config_home=directory)
+    from ..core.scans import parse_ffuf
+    try:
+        records = []
+        for finding in parse_ffuf(result.stdout):
+            # ffuf receives a numeric URL; restore the approved logical authority.
+            parsed = urlsplit(finding.url)
+            logical = urlunsplit((u.scheme, u.netloc, parsed.path, parsed.query, ''))
+            records.append({**finding.model_dump(), 'url':logical, 'target':u.hostname, 'destination':ip})
+    except (ValueError, TypeError):
+        records = []
+        result.ok, result.summary = False, 'Invalid ffuf JSON; no successful scan claimed'
     result.evidence = records
-    if result.ok and not records:
+    if result.ok and len(records) != len(words):
         result.ok = False
-        result.summary = 'ffuf returned no HTTP results; inspect connectivity and installed ffuf version'
+        result.summary = 'ffuf discovery is incomplete; inspect connectivity, timeout and installed ffuf version. Partial results retained.'
     elif result.ok:
         result.summary = f'{len(records)} public paths checked by real ffuf; redirects were not followed'
     return result

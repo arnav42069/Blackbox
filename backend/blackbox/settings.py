@@ -24,6 +24,11 @@ class Preferences(BaseModel):
     max_wall_seconds: int = Field(default=300, ge=5, le=300)
     retention_days: int = Field(default=30, ge=1, le=365)
     visual_effects: bool = False
+    vision_model: str | None = None
+    scan_freshness_seconds: int = Field(default=900, ge=0, le=86400)
+    http_rate: int = Field(default=2, ge=1, le=5)
+    http_concurrency: int = Field(default=1, ge=1, le=2)
+    discovery_timeout_seconds: int = Field(default=40, ge=1, le=40)
 
     @field_validator("model")
     @classmethod

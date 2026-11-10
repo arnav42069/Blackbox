@@ -39,8 +39,9 @@ def main():
             latest = json.loads((ROOT / 'qa-reports/latest.json').read_text())
             report = ROOT / latest['report']
             data = json.loads(report.read_text())
-            passed = process.returncode == 130 and not listening(8876) and data['status'] == 'stopped'
-            results.append({'method': method, 'exit_code': process.returncode, 'passed': passed, 'fixture_port_closed': not listening(8876), 'report': latest['report']})
+            journal = report.parent / 'cycle-0/browser-tool-journal.json'
+            passed = process.returncode == 130 and not listening(8876) and data['status'] == 'stopped' and journal.is_file()
+            results.append({'method': method, 'exit_code': process.returncode, 'passed': passed, 'fixture_port_closed': not listening(8876), 'browser_journal_retained': journal.is_file(), 'report': latest['report']})
             if not passed:
                 raise AssertionError(results[-1])
         finally:

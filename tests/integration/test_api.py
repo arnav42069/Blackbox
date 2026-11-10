@@ -25,7 +25,7 @@ async def test_chat_tool_image_persistence(client,app,mock_ollama,png):
     r=await client.post(f'/api/sessions/{sid}/messages', data={'text':'Check this screenshot and host tools'}, files={'images':('screen.png',png,'image/png')})
     assert r.status_code==200, r.text
     assert (await finish(app,sid))['status']=='completed'
-    assert base64.b64decode(mock_ollama.requests[0]['messages'][1]['images'][0])[:8]==b'\x89PNG\r\n\x1a\n'
+    assert base64.b64decode(mock_ollama.vision_requests[0]['messages'][0]['images'][0])[:8]==b'\x89PNG\r\n\x1a\n'
     assert mock_ollama.requests[0]['tools']
     tool_message=mock_ollama.requests[1]['messages'][-1]
     assert tool_message['role']=='tool' and tool_message['tool_name']=='host.preflight'

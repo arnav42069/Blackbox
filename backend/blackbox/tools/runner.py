@@ -12,7 +12,7 @@ from ..storage.files import clean_text
 
 class SubprocessRunner:
     def __init__(self):
-        self.binaries = {name: shutil.which(name) for name in ('ping', 'nmap', 'ffuf', 'ssh', 'curl', 'whatweb', 'uname', 'cat', 'free', 'lscpu', 'nvidia-smi', 'lspci')}
+        self.binaries = {name: shutil.which(name) for name in ('ip', 'ping', 'nmap', 'ffuf', 'ssh', 'curl', 'whatweb', 'openssl', 'uname', 'cat', 'free', 'lscpu', 'nvidia-smi', 'lspci')}
 
     async def run(self, binary, args, *, timeout=30, cap=65536, on_output=None, on_command=None, config_home=None):
         executable = self.binaries.get(binary)
@@ -21,7 +21,7 @@ class SubprocessRunner:
         started = time.monotonic()
         if on_command:
             on_command([executable, *args])
-        proc = await asyncio.create_subprocess_exec(executable, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'HOME': str(config_home or '/nonexistent'), 'XDG_CONFIG_HOME': str(config_home or '/nonexistent'), 'XDG_CONFIG_DIRS': str(config_home or '/nonexistent')})
+        proc = await asyncio.create_subprocess_exec(executable, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL, start_new_session=True, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'HOME': str(config_home or '/nonexistent'), 'XDG_CONFIG_HOME': str(config_home or '/nonexistent'), 'XDG_CONFIG_DIRS': str(config_home or '/nonexistent')})
         chunks = {'stdout': bytearray(), 'stderr': bytearray()}
         truncated = False
         total = 0

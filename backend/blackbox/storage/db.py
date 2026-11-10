@@ -49,6 +49,14 @@ class Database:
         CREATE TABLE IF NOT EXISTS tool_events (
             id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs ON DELETE CASCADE, tool_name TEXT,
             args_json TEXT, output_json TEXT, exit_code INTEGER, status TEXT, started_at REAL, ended_at REAL);
+        CREATE TABLE IF NOT EXISTS task_goals (
+            session_id TEXT PRIMARY KEY REFERENCES sessions ON DELETE CASCADE, payload_json TEXT, updated_at REAL);
+        CREATE TABLE IF NOT EXISTS scan_results (
+            id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions ON DELETE CASCADE,
+            scope_key TEXT, tool TEXT, args_json TEXT, target TEXT, observed_at REAL,
+            stored_at REAL, status TEXT, complete INTEGER, source TEXT, evidence_id TEXT,
+            findings_json TEXT, details_json TEXT);
+        CREATE INDEX IF NOT EXISTS scans_session ON scan_results(session_id,scope_key,observed_at);
         CREATE TABLE IF NOT EXISTS model_capabilities (
             model_digest TEXT PRIMARY KEY, model_name TEXT, metadata_json TEXT, probe_json TEXT, tested_at REAL);
         """)
@@ -59,9 +67,23 @@ class Database:
                 self.conn.execute("UPDATE runs SET status='interrupted', ended_at=? WHERE status='running'", (now(),))
                 self.conn.execute("UPDATE sessions SET status='interrupted' WHERE status='running'")
                 self.conn.execute("UPDATE sessions SET scope_json=NULL")
+                for task in self.rows('SELECT session_id,payload_json FROM task_goals'):
+                    payload=json.loads(task['payload_json'])
+                    if payload.get('status')=='active':
+                        payload['status']='interrupted'
+                        payload['checkpoint']={'reason':'Backend restarted; explicit continuation and renewed scope are required', 'at':now(), 'pending':payload.get('pending')}
+                        self.conn.execute('UPDATE task_goals SET payload_json=?,updated_at=? WHERE session_id=?',(json.dumps(payload),now(),task['session_id']))
                 for run in stale:
                     for tool in self.rows("SELECT id,tool_name FROM tool_events WHERE run_id=? AND status='interrupted'", (run['id'],)):
                         self.event(run['session_id'], run['id'], 'tool_finished', {'tool_id': tool['id'], 'name': tool['tool_name'], 'status': 'interrupted', 'ok': False, 'summary': 'Backend restarted; command was not resumed'})
+                    for message in self.messages(run['session_id'], 1000):
+                        if message['metadata'].get('run_id') == run['id'] and message['metadata'].get('state') == 'streaming':
+                            metadata = {**message['metadata'], 'state': 'complete', 'conversation_kind': 'progress'}
+                            self.execute('UPDATE messages SET metadata_json=? WHERE id=?', (json.dumps(metadata), message['id']))
+                    mid = self.message(run['session_id'], 'assistant',
+                        'Backend restarted. The run was interrupted; partial output and evidence are retained. Renew scope and retry to continue.',
+                        metadata={'run_id': run['id'], 'conversation_kind': 'final', 'state': 'complete'})
+                    self.event(run['session_id'], run['id'], 'assistant_message', {'message_id': mid, 'content': self.one('SELECT content FROM messages WHERE id=?', (mid,))['content'], 'metadata': {'run_id': run['id'], 'conversation_kind': 'final', 'state': 'complete'}})
                     self.event(run['session_id'], run['id'], 'run_finished', {'reason': 'interrupted'})
         self.private_files()
 

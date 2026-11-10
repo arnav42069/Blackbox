@@ -16,6 +16,8 @@ class MockOllama:
     def __init__(self):
         self.requests = []
         self.review_requests = []
+        self.vision_requests = []
+        self.image_observation = {"category":"other", "visible_text":"red square", "uncertainties":[]}
         self.review_replies = []
         self.replies = []
         self.vision = True
@@ -30,6 +32,9 @@ class MockOllama:
         if request.url.path == '/api/show':
             return httpx.Response(200, json={'capabilities': ['completion'] + (['vision'] if self.vision else []) + (['tools'] if self.tools else [])})
         body = json.loads(request.content)
+        if body['messages'][0].get('content', '').startswith('BLACKBOX_IMAGE_OBSERVATIONS:'):
+            self.vision_requests.append(body)
+            return httpx.Response(200, json={'message': {'content':json.dumps(self.image_observation)}})
         if body.get('tools', [{}])[0].get('function', {}).get('name') == 'agent.review_completion':
             self.review_requests.append(body)
             verdict = self.review_replies.pop(0) if self.review_replies else {'decision': 'complete', 'reason': 'The requested fixture task has been completed with observed results.', 'remaining_steps': []}

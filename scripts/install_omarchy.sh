@@ -30,9 +30,17 @@ wrapper=pathlib.Path.home()/'.local/bin/blackbox'
 wrapper.write_text('#!/usr/bin/env bash\nexec '+shlex.quote(str(project/'.venv/bin/blackbox'))+' "$@"\n')
 wrapper.chmod(0o755)
 PY
-for optional in ping nmap ffuf ssh; do
-  if ! command -v "$optional" >/dev/null; then
-    echo "Optional tool $optional missing. Arch packages: iputils nmap ffuf openssh (availability varies)."
+# Native baseline tools are required for the full supported lab capability set.
+for entry in 'ping:iputils' 'nmap:nmap' 'ssh:openssh'; do
+  binary="${entry%%:*}"; package="${entry#*:}"
+  if ! command -v "$binary" >/dev/null; then
+    echo "Missing baseline requirement $package ($binary). Install: sudo pacman -S --needed iputils nmap openssh" >&2
+  fi
+done
+for entry in 'ffuf:ffuf:preferred HTTP discovery (bounded native fallback available)' 'whatweb:whatweb:optional web fingerprinting' 'grim:grim:optional native screenshot capture' 'wl-copy:wl-clipboard:optional native clipboard' 'wl-paste:wl-clipboard:optional native clipboard'; do
+  IFS=: read -r binary package role <<< "$entry"
+  if ! command -v "$binary" >/dev/null; then
+    echo "Missing $package: $role. Install: sudo pacman -S --needed $package (repository availability varies)."
   fi
 done
 echo 'Installed. Run: ~/.local/bin/blackbox doctor'

@@ -55,3 +55,26 @@ separately from verified observations and retains tool IDs/results. Always check
 evidence for consequential claims. Tools cannot add authorization even when remote
 content or a model asks them to. No auth attacks, exploit executor, writes to remote
 hosts, shell, sudo, arbitrary host reads or credential guessing are registered.
+
+
+## Planning, screenshots and cached observations
+
+Intent classification and vision results cannot grant scope. The executor validates
+registered schemas, action policy, current destination/port authorization and
+configured discovery limits before reuse or execution. The policy layer separately
+rejects SSH for HTTP/scan/image intents and for tasks without a remote-access
+requirement. SSH remains read-only SFTP; remote shell execution is unavailable.
+
+A screenshot is a model transcription, not proof of a live service or scan time.
+Literal text, quoted findings, uncertainty and inferred service-to-URL mappings are
+stored separately from executed scan evidence. Imported/legacy outputs likewise
+remain explicitly unverified. Both may supply candidate endpoints only inside
+current approved scope. Scan TTL refers to observation time (upload time for an
+image with unknown original scan time). Visual accuracy is model-dependent; the
+regression fixture mocks transcription and cannot establish real-model OCR accuracy.
+
+Only fresh complete successful executed scans satisfy scan-cache requests. Scope
+changes, session changes, TTL expiry and explicit rescan prevent hits. A later
+failed/incomplete equivalent attempt invalidates prior success. Reuse emits a
+visible trace and retains the original timestamp/evidence ID. Storage is bounded
+to 1000 structured records per session; session deletion/retention cascades to them.
