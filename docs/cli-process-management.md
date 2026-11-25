@@ -1,163 +1,102 @@
 # CLI process management
 
 ```bash
+blackbox status
+blackbox status --json
 blackbox kill
 blackbox restart
-blackbox restart --model huihui_ai/qwen3.5-abliterated:4b
-blackbox restart --port 8877 --no-browser
+blackbox restart --model qwen3.5:4b --port 8877 --no-browser
+blackbox status --data-dir /absolute/path/to/private-data
 blackbox kill --data-dir /absolute/path/to/private-data
-blackbox restart --data-dir /absolute/path/to/private-data
-blackbox doctor
-blackbox --help
 ```
 
-`kill` stops a verified backend with SIGTERM, waits up to three seconds, then uses
-SIGKILL if necessary. Output identifies the PID and the signal needed. Already
-stopped instances return success with “No running BlackBox instance found.”
-Permission/identity/port errors return a nonzero status with an actionable message.
-No sudo, pgrep, shell kill command, or process-name substring matching is used.
+`kill` stops the independently verified backend with SIGTERM, waits up to three
+seconds, then uses SIGKILL if its pinned process identity still matches. It checks
+exit, port release and lock availability before reporting completion. An already
+stopped instance returns success. Identity, permission and port errors are
+reported without using sudo or terminating unrelated processes.
 
-`restart` captures the effective startup model, port, data/config directories,
-Ollama URL and browser option. Optional model/port/config-directory/no-browser flags
-override preserved values. Per-session model selections and transcript history
-remain in SQLite. The new backend uses a fresh interpreter from the current
-installation, with the current package checkout first on its import path. It never
-pulls Git changes, installs packages, rebuilds assets or resumes the old interpreter.
+`restart` preserves startup model, port, data/config directories, Ollama URL and
+browser choice, with optional CLI overrides. It starts a fresh detached interpreter
+when replacing a running CLI instance. It verifies both Uvicorn readiness and an
+HTTP health response carrying the new backend's instance ID. Startup errors and
+timeouts clean up the new child. With no old instance, restart retains normal
+foreground startup behavior. Restart does not install dependencies or build UI
+assets. New pairing credentials are printed; old credentials and scopes expire.
+Session history, execution checkpoints and data files use the existing database
+recovery and retention policies.
 
-The command waits for the old backend to exit, checks port release (allowing normal
-TCP TIME_WAIT), starts one managed detached backend, and waits for Uvicorn to bind
-its socket. Only then does it print the new PID, model, listening address and fresh
-one-time pairing URL. A private pipe carries readiness/authentication data; tokens
-are not written to the instance record or the detached backend log. Runtime output
-is in the private `server.log` under the data directory. Failed/timed-out startup
-cleans up the new child; there is no automatic retry/restart loop. An explicitly
-requested conflicting port is checked before stopping the old backend.
+`status` reports process PID/start/executable/command/instance ID; server and
+operation locks; port availability/listening state; and the health request result.
+`--json` produces the same information as structured JSON. `running` and `stopped`
+return zero; `unhealthy` and `unverified` return one. It creates no data directory
+and changes no persistent state. An HTTP 200 alone cannot prove process ownership.
+Older backends without a health ID expose `instance_matches: null`.
 
-If no instance exists, `restart` behaves like normal **foreground** startup,
-including browser behavior. A restart with a running instance returns after the
-new managed backend becomes ready. `--no-browser` is preserved unless explicitly
-set; the CLI does not have a flag to force browser opening when the saved option
-was true. New pairing credentials are mandatory. The normal database startup path
-revokes every previous session scope and interrupts active runs/goals.
+## Ownership and races
 
-## Identity and locking
+The installed `blackbox` launcher or exact `python -m blackbox[.cli]` command must
+match this environment. Discovery requires same-user process identity and kernel
+ownership of the exact private `server.lock` file. New records also bind the
+command, boot ID and random instance ID. A pidfd pins each signalled process, with
+identity checks after opening it and before escalation. Parent PID changes caused
+by orphaning are allowed. PID reuse, unrelated Python/Uvicorn processes, protected
+CLI/ancestor processes and incidental command substrings cannot authorize signals.
 
-Discovery scans same-user `/proc` entries, considering only exact installed
-BlackBox entrypoint/module invocations. Before any signal, it verifies:
+Descriptor stat and exclusive flock evidence are checked together. Btrfs can
+report different device numbers through stat and fdinfo; its lock superblock
+device is not compared with its subvolume stat device. An open file without an
+actual flock remains insufficient proof.
 
-- UID, trusted executable/entrypoint, PID start time and protected process exclusions.
-- Ownership and privacy of the data directory and regular lock/record files.
-- The live PID's kernel `flock` ownership of that exact `server.lock` inode,
-  verified through its `/proc/<pid>/fdinfo` locked descriptor.
-- New-format record fields matching the process, data directory and package source.
+`server.lock` remains locked throughout backend lifetime and is never unlinked.
+`lifecycle.lock` serializes start/kill/restart operations with bounded contention.
+A service-managed or privately launched replacement acquires the lifetime lock
+while its controller retains the operation lock. Startup publishes identity before
+slow app initialization, so starting backends remain stoppable. Stale registrations
+are removed only after acquiring the lifetime lock. An invisible owner or malformed
+record never authorizes shutdown or lock removal. Genuine inaccessible `/proc`
+identity requires running as the backend owner with process visibility.
 
-A Linux pidfd pins the process before a second identity check and signal delivery,
-preventing a reused PID from receiving the signal. The invoking CLI, its ancestors,
-PID 1, unrelated Uvicorn servers and applications with incidental “blackbox”
-arguments are excluded. Known fixed-tool children of a verified backend are also
-pinned and cleaned up if needed; unrelated browser/application children are excluded.
+Legacy `control.lock` is ignored only when held by the verified backend being
+stopped; another legacy controller gets a bounded wait. Interpreter aliases within
+the same environment are recognized. Record-less old CLI processes can be adopted
+only with independently verified command, executable and flock ownership.
 
-`lifecycle.lock` serializes start/kill/restart operations, with a five-second bounded
-wait and owner diagnostics. `server.lock` prevents duplicate backends and stays held
-for the backend's lifetime. Shutdown signals the verified backend through a pidfd
-without acquiring its `server.lock`; only after shutdown is that lock acquired for
-cleanup. Startup releases its operation lock as soon as the process record exists,
-before application initialization, so even a starting backend remains stoppable.
+Known backend tool children are pinned before shutdown. New tools also carry exact
+instance/data-directory markers so detached descendants and tools orphaned by a
+crash can be cleaned up from a stale registration. Unrelated untagged tools and
+browser/application children are excluded.
 
-Legacy `control.lock` is retained: a verified backend holding it cannot block its
-own shutdown; a separate old lifecycle controller must finish first. Lock files are
-**never unlinked**. Stale records can be removed only after
-obtaining the actual server lock; a still-live recorded backend with a missing or
-unverifiable lock blocks stale cleanup and duplicate startup. Symlinks, malformed
-records and unsafe permissions are rejected rather than guessed around.
+Without a selector, discovery selects one verified instance. Multiple instances
+require `--data-dir`; `BLACKBOX_DATA_DIR` also selects an instance. No command means
+“kill all”. Commands work from any working directory.
 
-Interpreter aliases such as `.venv/bin/python` and `.venv/bin/python3` are accepted
-only within the same environment and when they resolve to the same executable.
-A provably expired registration can be recovered from the independently verified
-live lock owner; the stale recorded PID is never used as authority to signal.
+## User services and development
 
-A running pre-record **CLI** backend remains discoverable by its exact installed
-entrypoint, executable and kernel-owned data lock. Supported flags/environment and
-preferences supply its startup configuration. Record-less arbitrary Uvicorn/reload
-servers do not have this proof and are deliberately not terminated. Use the installed
-`blackbox` launcher for managed lifecycle commands. The existing development reload
-script and QA orchestrator retain their own lifecycle controls.
+A systemd **user** service should execute the installed `blackbox` CLI directly
+(or use an exec wrapper), with the backend as MainPID. Its cgroup and manager's
+MainPID must both match the verified process before service operations. Explicit
+manager stop prevents `Restart=always` from undoing a kill. Restart preserves the
+same service, including transient units, and confirms a fresh healthy registration.
+A live D-Bus reference retains a transient unit across stop/start. These operations
+use systemctl and systemd's existing libsystemd; no Python dependency is added.
+Pairing URLs for service replacements are in `journalctl --user -u UNIT`.
 
-Without a selector, one verified instance is selected automatically. Multiple
-instances require `--data-dir`; `BLACKBOX_DATA_DIR` also acts as a selector. This
-never means “kill all”. Commands work from any working directory.
+Change a service's ExecStart configuration before requesting different startup
+options. Conflicting CLI overrides are rejected before stopping the running unit.
+System services and services with an unrelated MainPID are not stopped as units.
 
-## Dependencies and installation
+`./scripts/dev.sh` uses the same managed CLI backend and watches frontend output.
+It forwards CLI flags, including `--data-dir`, `--port` and `--no-browser`. Apply
+Python changes with `blackbox restart`; a fresh pairing link is required. Arbitrary
+unregistered Uvicorn/reload launchers retain their own lifecycle controls and are
+never targeted by a command substring.
 
-Requires Linux `/proc`, visible kernel flock ownership, and pidfd APIs (modern Arch/
-Omarchy kernels and Python support these). If identity cannot be established, the
-command refuses to signal. Missing native tools retain existing capability warnings
-and fallbacks; missing Python runtime dependencies/configuration errors are reported
-without automatic installation.
+## Installation and checks
 
-Restart warns if the frontend build is absent or older than frontend source files.
-Run the printed `npm --prefix ... run build` command when necessary. CLI-only changes
-do not require a frontend rebuild. A noneditable Python installation requires its
-normal reinstall/refresh to expose new source changes.
+For this workspace, `~/.local/bin/blackbox` executes this checkout's editable
+`.venv/bin/blackbox`. Python CLI changes take effect immediately in new commands;
+a running backend loads new runtime code after restart. Linux pidfds and readable
+process identity/lock evidence are required.
 
-For this workspace, `blackbox-local` is installed editable from
-`/home/arnav/Projects/blackbox`, and `~/.local/bin/blackbox` resolves to this checkout's
-`.venv/bin/blackbox`. The actual installed `blackbox --help` displays `kill` and
-`restart`; **no reinstall or launcher refresh is needed here**. A running old backend
-needs restart to load the updated runtime. The developer's actual backend was not
-terminated or restarted during implementation/testing.
-
-## Implementation validation
-
-All signalling tests used mocked operations or disposable processes with explicit
-pytest-owned temporary data directories. No test issued a global, unscoped kill or
-restart command. The installed launcher was checked read-only with `--help` from
-`/tmp`.
-
-| Command | Actual result |
-| --- | --- |
-| `.venv/bin/python -m pytest -q tests/unit/test_processes.py tests/integration/test_cli_lifecycle.py --junitxml=qa-reports/cli-lifecycle.xml` | **48 passed**, 0 failed, 18.37 s |
-| `.venv/bin/python -m pytest -q --junitxml=qa-reports/cli-full-regression.xml` | **282 passed**, 0 failed, 0 skipped, 53.40 s |
-| `npm --prefix frontend run typecheck` | Passed |
-| `npm --prefix frontend run build` | Passed |
-| `npm --prefix frontend run test:e2e` (final rerun) | **14 passed**, 0 failed, 12.3 s |
-| `bash -n scripts/install_omarchy.sh` | Passed |
-| `git diff --check` | Passed |
-| `/home/arnav/.local/bin/blackbox --help` from `/tmp` | Passed; both commands available |
-
-The first disposable integration run found one lifecycle failure: a no-instance foreground
-restart was not recognized as a backend because its command line retained the word
-`restart`. Fixed the exact-command parser and reran the affected tests. Added a
-separate guard so a transient restart controller without a backend record cannot
-be mistaken for a server during cleanup. All final tests above pass.
-
-Coverage includes graceful SIGTERM, real three-second SIGKILL escalation, no process,
-stale/malformed/foreign records, live/missing/unsafe locks, PID reuse, permission
-failures, multiple data directories, unrelated Uvicorn/incidental arguments, owned
-tool cleanup, preserved/overridden startup configuration, foreground restart with no
-instance, startup failures, conflicting ports, fresh pairing credentials, revoked
-scope, concurrent restarts, duplicate/orphan prevention, help and offline doctor.
-
-Files changed for this task:
-
-- `backend/blackbox/cli.py`: command integration, registration, lifecycle locking,
-  fresh-process startup/readiness and error reporting.
-- `backend/blackbox/processes.py` (new): Linux identity/lock inspection, pidfd signals,
-  stale-record handling, port checks and managed child launch/cleanup.
-- `tests/unit/test_processes.py` (new): deterministic process-operation tests.
-- `tests/integration/test_cli_lifecycle.py` (new): disposable real CLI/backend tests.
-- `tests/e2e/chat-tool-loop.spec.ts`: scoped Python syntax/copy assertions to the Python example rather than counting the separate evidence JSON block.
-- `README.md`: usage and configuration/credential behavior.
-- `docs/cli-process-management.md` (new): implementation, limits and results.
-
-Other existing workspace changes and QA orchestration/token optimizations were
-preserved. No dependencies were added and no system configuration was edited.
-
-The latest browser suite initially reported **13 passed, 1 failed**: a streaming
-Markdown assertion counted highlighted strings/code-copy controls across both the
-Python example and appended tool-evidence JSON. Scoped those checks to the Python
-block without changing application behavior. The affected test rerun
-(`npm --prefix frontend run test:e2e -- --grep 'authorized lab inspection'`) passed
-**1/1** (3.3 s).
-
-The complete browser suite rerun passed **14/14** after the scoped assertion fix.
+See [the verified investigation and test results](lifecycle-lock-repair.md).

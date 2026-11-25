@@ -90,7 +90,8 @@ def create_app(settings: Settings | None = None, transport=None):
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.1.0"}
+        record=getattr(app.state,'instance_record',{})
+        return {"ok": True, "version": "0.1.0", "instance_id":record.get('id'), "pid":record.get('pid')}
 
     @app.post("/api/pair")
     async def pair(body: Pair):
@@ -139,13 +140,17 @@ def create_app(settings: Settings | None = None, transport=None):
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
         from .core.goals import GoalController
+        saved=session(sid)
         goal = GoalController.load(db, sid)
-        return {**session(sid), 'task_goal':goal.model_dump() if goal else None, "messages": db.messages(sid), "events": db.events(sid)}
+        availability=await ollama.selection_status(saved['model'])
+        return {**saved, 'model_availability':availability, 'task_goal':goal.model_dump() if goal else None, "messages": db.messages(sid), "events": db.events(sid)}
 
     @app.patch("/api/sessions/{sid}")
     async def update_session(sid: str, body: NewSession):
         idle(sid)
         prefs = Preferences(model=body.model or settings.prefs.model)
+        await ollama.capabilities(prefs.model)
+        idle(sid)
         db.execute("UPDATE sessions SET model=? WHERE id=?", (prefs.model, sid))
         return session(sid)
 

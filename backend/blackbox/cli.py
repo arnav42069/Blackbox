@@ -11,14 +11,14 @@ def main():
     import os
     from .processes import InstanceError
     parser = argparse.ArgumentParser(description="BlackBox — scoped local Ollama workbench")
-    parser.add_argument("command", nargs="?", choices=["doctor", "kill", "restart"],
-                        help="doctor: diagnostics; kill: safely stop backend; restart: preserve configuration and start fresh")
+    parser.add_argument("command", nargs="?", choices=["doctor", "kill", "restart", "status"],
+                        help="doctor: diagnostics; kill: safely stop backend; restart: start fresh; status: process, lock, port and health")
     parser.add_argument("--no-browser", action="store_true", default=None)
     parser.add_argument("--port", type=int, help="Listening port (default 8765; restart preserves existing port)")
     parser.add_argument("--model", help="Ollama model; overrides preserved model on restart")
     parser.add_argument("--data-dir", type=Path, help="Data directory; selects an instance when multiple backends run")
     parser.add_argument("--config-dir", type=Path, help="Configuration directory")
-    parser.add_argument("--json", action="store_true", help="Machine-readable doctor output")
+    parser.add_argument("--json", action="store_true", help="Machine-readable doctor/status output")
     parser.add_argument("--probe", action="store_true", help="With doctor: test selected model vision/tools and cache by digest")
     args = parser.parse_args()
     if args.probe and args.command != "doctor":
@@ -34,7 +34,23 @@ def main():
         if args.model is not None:
             from .settings import Preferences
             Preferences(model=args.model)
-        if args.command in {'kill','restart'}:
+        if args.command == 'status':
+            from .processes import select_instance, status
+            selector=args.data_dir or os.environ.get('BLACKBOX_DATA_DIR')
+            instance=select_instance(selector) if selector is None else None
+            report=status(selector or (instance.data if instance else settings.data_dir),settings.port)
+            if args.json:
+                print(json.dumps(report,indent=2))
+            else:
+                print(f"BlackBox: {report['state']}\nData directory: {report['data_dir']}")
+                print('Process: '+json.dumps(report['process']))
+                print('Backend lock: '+json.dumps(report['lock']))
+                print('Lifecycle lock: '+json.dumps(report['operation_lock']))
+                print('Port: '+json.dumps(report['port']))
+                print('Health: '+json.dumps(report['health']))
+            if report['state'] in {'unhealthy','unverified'}:
+                parser.exit(1)
+        elif args.command in {'kill','restart'}:
             selector = args.data_dir or os.environ.get('BLACKBOX_DATA_DIR')
             lifecycle(args, settings, selector)
         else:
@@ -53,7 +69,8 @@ def main():
 
 def lifecycle(args, settings, selector):
     import os
-    from .processes import select_instance, private_directory, file_lock, clean_stale, stop, wait_port, launch
+    from contextlib import ExitStack
+    from .processes import select_instance, private_directory, file_lock, clean_stale, stop, wait_port, launch, InstanceError
     print('BlackBox: Searching for running instances...' if args.command=='kill' else 'BlackBox: Restarting...',flush=True)
     instance=select_instance(selector)
     data=instance.data if instance else settings.data_dir.expanduser().absolute()
@@ -63,12 +80,22 @@ def lifecycle(args, settings, selector):
             return
         settings.prepare()
     data=private_directory(data)
-    with file_lock(data/'lifecycle.lock',timeout=5):
+    with file_lock(data/'lifecycle.lock',timeout=5), ExitStack() as references:
         instance=select_instance(data)
         from .processes import wait_legacy_operation
         wait_legacy_operation(data,instance)
         if instance:
             config=dict(instance.config)
+            from .processes import service_unit, service_reference, stop_service, start_service
+            unit=service_unit(instance)
+            if unit:
+                references.enter_context(service_reference(unit))
+            if unit and args.command=='restart':
+                overrides={'port':args.port,'model':args.model,
+                           'config_dir':str(args.config_dir.expanduser().absolute()) if args.config_dir else None,
+                           'no_browser':args.no_browser}
+                if any(value is not None and value!=config.get(key) for key,value in overrides.items()):
+                    raise InstanceError(f'Instance is managed by user service {unit}; change its ExecStart configuration before restarting with different options. The running instance was preserved.')
             if args.command=='restart':
                 print(f"Preserving model: {config['model']}\nPreserving port: {config['port']}",flush=True)
             if args.command=='restart':
@@ -76,7 +103,10 @@ def lifecycle(args, settings, selector):
                 from .app import create_app  # Validate installed runtime imports before stopping.
                 if args.port is not None and args.port!=config['port']:
                     wait_port(args.port, timeout=0)
-            stop(instance)
+            if unit:
+                stop_service(unit,instance)
+            else:
+                stop(instance)
             wait_port(config['port'])
             clean_stale(data)
             if args.command=='kill':
@@ -90,11 +120,15 @@ def lifecycle(args, settings, selector):
             if args.no_browser is not None:
                 config['no_browser']=args.no_browser
             print('Starting BlackBox...',flush=True)
-            ready=launch(config)
+            ready=start_service(unit,data,instance.instance_id) if unit else launch(config)
             print(f"New backend PID: {ready['pid']}\nModel: {ready['model']}\nListening on: {ready['address']}",flush=True)
             for message in ready.get('warnings',[]):
                 print(message,flush=True)
-            print(f"BlackBox restarted successfully.\nPairing URL: {ready['pairing_url']}",flush=True)
+            print('BlackBox restarted successfully; instance health confirmed.',flush=True)
+            if ready.get('pairing_url'):
+                print(f"Pairing URL: {ready['pairing_url']}",flush=True)
+            elif unit:
+                print(f'Pairing URL is in journalctl --user -u {unit}.',flush=True)
             return
         from .processes import lock_holders, occupied_lock, InstanceError
         if lock_holders(data/'server.lock'):
@@ -115,7 +149,7 @@ def serve(settings,args):
     import threading
     from contextlib import ExitStack
     import uvicorn
-    from .processes import file_lock, private_directory, inspect, record_path, PACKAGE, asset_warnings
+    from .processes import file_lock, private_directory, inspect, record_path, PACKAGE, asset_warnings, boot_id
     from .storage.files import atomic_write
     from .storage.db import uid
     from .app import create_app
@@ -135,7 +169,7 @@ def serve(settings,args):
                 ready_fd=None
     try:
         with ExitStack() as locks:
-            if ready_value is None:
+            if ready_value is None and not os.environ.get('INVOCATION_ID'):
                 control=locks.enter_context(file_lock(data/'lifecycle.lock',timeout=5))
             from .processes import wait_legacy_operation, select_instance
             wait_legacy_operation(data,select_instance(data))
@@ -152,6 +186,7 @@ def serve(settings,args):
                     'config_dir':str(settings.config_dir.expanduser().absolute()),'ollama_url':settings.ollama_url,
                     'no_browser':bool(args.no_browser)}
             record={'id':uid(),'pid':process.pid,'start':process.start,'executable':process.executable,
+                    'argv':list(process.argv),'boot_id':boot_id(),
                     'data_dir':str(data),'source':str(PACKAGE),'config':config}
             atomic_write(record_path(data),json.dumps(record).encode())
             # A backend holds server.lock for its lifetime, not the operation lock.
@@ -161,6 +196,11 @@ def serve(settings,args):
                 fcntl.flock(control,fcntl.LOCK_UN)
                 control=None
             app=create_app(settings)
+            app.state.instance_record=record
+            # Fixed subprocess tools inherit this marker so detached/orphaned
+            # children can still be attributed to this exact backend instance.
+            os.environ['BLACKBOX_INSTANCE_ID']=record['id']
+            os.environ['BLACKBOX_INSTANCE_DATA']=str(data)
             if args.model is not None:
                 settings.prefs.model=args.model
             address=f'http://127.0.0.1:{settings.port}'
@@ -178,7 +218,7 @@ def serve(settings,args):
                         fcntl.flock(control,fcntl.LOCK_UN)
                         control=None
                     if ready_value is not None:
-                        report({'pid':process.pid,'model':settings.prefs.model,'address':address,
+                        report({'pid':process.pid,'instance_id':record['id'],'model':settings.prefs.model,'address':address,
                                 'pairing_url':pairing,'warnings':warnings})
                     else:
                         for message in warnings:

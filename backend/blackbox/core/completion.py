@@ -6,6 +6,56 @@ from pydantic import Field, model_validator
 from ..tools.base import Arguments
 
 
+_LOCAL_FILE = re.compile(
+    r'\s*(?:read|open|view)\s+(?:the\s+)?(?P<workspace>(?:local\s+)?workspace\s+)?'
+    r'(?P<file>file\s+)?(?P<path>`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\'|[\w./~-]+)'
+    r'(?P<suffix>\s+(?:from|in)\s+(?:the\s+)?(?:local\s+)?workspace)?', re.I,
+)
+_NEXT_LOCAL_FILE = re.compile(r'\s*(?:[;,]\s*|\s+(?:and|then)\s+)', re.I)
+_LOCAL_FILE_END = re.compile(r'\s*(?:and\s+(?:explain what you found|summarize the contents))?[.!?]?\s*', re.I)
+LOCAL_IMAGE_AND_HOST = re.compile(
+    r'\s*(?:describe|check|inspect|review)\s+(?:(?:the|this|attached)\s+)*(?:image|screenshot)'
+    r'\s+and\s+(?:check\s+)?(?:the\s+)?(?:local\s+)?host(?P<tools>\s+tools)?[.!?]?\s*', re.I,
+)
+
+
+def named_workspace_reads(instruction):
+    """Recognize requests consisting of explicitly named local file reads."""
+    paths, cursor = [], 0
+    while match := _LOCAL_FILE.match(instruction, cursor):
+        if not (match['workspace'] or match['suffix']):
+            break
+        raw = match['path']
+        if raw[0] in ('`', '"', "'"):
+            path = raw[1:-1]
+        else:
+            path = raw.removesuffix('.') if match.end() == len(instruction) else raw
+            if not (match['file'] or '.' in path or '/' in path):
+                break
+        paths.append(path)
+        if _LOCAL_FILE_END.fullmatch(instruction, match.end()):
+            return paths
+        separator = _NEXT_LOCAL_FILE.match(instruction, match.end())
+        if not separator:
+            break
+        cursor = separator.end()
+    return []
+
+
+def local_completion_problem(expected_paths, observed_paths, image_request, image, hosts):
+    if any(path not in observed_paths for path in expected_paths):
+        return 'Each requested workspace file requires its own successful, complete read.'
+    if image_request:
+        if not image or not image.get('attachment_ids'):
+            return 'A current attachment observation is required.'
+        if image_request['tools']:
+            if not any(isinstance(host['facts'].get('binaries'), dict) and host['facts']['binaries'] for host in hosts):
+                return 'A local tool availability observation is required.'
+        elif not hosts:
+            return 'A successful local host diagnostic is required.'
+    return ''
+
+
 class CompletionReview(Arguments):
     decision: Literal['complete', 'continue']
     reason: str = Field(min_length=1, max_length=600)

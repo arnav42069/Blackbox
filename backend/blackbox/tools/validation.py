@@ -56,7 +56,7 @@ def normalize(spec,raw,settings):
 
 def classify_error(exc,tool):
     fields=[]
-    if isinstance(exc,ScopeDenied):
+    if isinstance(exc,ScopeDenied) or isinstance(exc,OSError) and exc.errno == errno.ELOOP:
         kind,code='policy_denial','POLICY_DENIED'
     elif isinstance(exc,ValidationError):
         kind,code='validation','INVALID_ARGUMENTS'

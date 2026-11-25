@@ -8,9 +8,37 @@ import httpx
 from pydantic import Field,field_validator
 from typing import Literal
 
-from .base import Arguments, ToolResult
+from .base import Arguments, ToolResult, ToolError
 from ..core.scope import hostname, ScopeDenied
 from ..storage.files import clean_text
+from html.parser import HTMLParser
+
+
+class PageMetadata(HTMLParser):
+    """Bounded public observations, without executing remote code."""
+    def __init__(self):
+        super().__init__()
+        self.in_title=False
+        self.title=''
+        self.generators=[]
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'title':
+            self.in_title = True
+        if tag == 'meta' and len(self.generators) < 8:
+            attrs = dict(attrs)
+            name = (attrs.get('name') or '').strip().lower()
+            content = (attrs.get('content') or '').strip()
+            if name == 'generator' and content:
+                self.generators.append(content[:256])
+
+    def handle_endtag(self, tag):
+        if tag=='title':
+            self.in_title=False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title=(self.title+data)[:512]
 
 # A small curated wordlist makes the maximum request count deterministic. No arbitrary files.
 WORDLISTS = {'small': ['', 'robots.txt', 'sitemap.xml', 'index.html', 'admin', 'login', 'api', 'health', 'status', 'docs', 'backup', '.well-known/security.txt']}
@@ -38,10 +66,11 @@ class Discover(Arguments):
 
 def parse_url(value):
     u = urlsplit(value)
-    if u.scheme not in {'http', 'https'} or not u.hostname or u.username or u.password or u.fragment or any(ord(c)<33 for c in value):
+    if (u.scheme not in {'http', 'https'} or not u.hostname or u.username is not None
+            or u.fragment or any(ord(c)<33 for c in value)):
         raise ValueError('Use an HTTP(S) URL without credentials or fragments')
     hostname(u.hostname)
-    port = u.port or (443 if u.scheme == 'https' else 80)
+    port = u.port if u.port is not None else (443 if u.scheme == 'https' else 80)
     if not 1 <= port <= 65535:
         raise ValueError('Invalid URL port')
     return u, port
@@ -75,18 +104,27 @@ async def fetch(ctx, value, method='GET', redirect_limit=3, follow=True):
                     data.extend(chunk[:max(0, 32769-len(data))])
                     if len(data)>32768:
                         break
-                return ToolResult(ok=True, stdout=clean_text(data[:32768].decode(errors='replace')), evidence=evidence, summary=f'HTTP {response.status_code}; remote content is untrusted', truncated=len(data)>32768)
+                text=clean_text(data[:32768].decode(errors='replace'))
+                if 'html' in record['content_type'] or text.lstrip().startswith('<'):
+                    page=PageMetadata()
+                    page.feed(text)
+                    record.update(title=page.title, generators=page.generators)
+                return ToolResult(ok=True, stdout=text, evidence=evidence, summary=f'HTTP {response.status_code}; remote content is untrusted', truncated=len(data)>32768)
     raise ValueError('No HTTP response')
 
 
 async def inspect(ctx, args):
     if args.method != 'HEAD' or not ctx.runner.binaries.get('curl'):
-        return await fetch(ctx, args.url, args.method)
+        return await fetch(ctx, args.url, args.method, follow=args.method == 'GET')
     u, port = parse_url(args.url)
     ip = await ctx.scope.destination(u.hostname, port)
     ctx.request()
     address = f'[{ip}]' if ':' in ip else ip
     result = await ctx.runner.run('curl', ['--disable', '--noproxy', '*', '--silent', '--show-error', '--head', '--max-time', '8', '--max-redirs', '0', '--resolve', f'{u.hostname}:{port}:{address}', '--', args.url], timeout=10, on_output=ctx.output, on_command=ctx.command)
+    if not result.ok and result.exit_code in {5, 6, 7, 18, 28, 52, 55, 56}:
+        result.error = ToolError(kind='transient', code='EXECUTION_TRANSIENT',
+            message=result.summary, retryable=True,
+            suggestions=['Inspect retained endpoint evidence or choose another authorized endpoint. Retry this endpoint only in a later explicit run.'])
     if result.ok:
         import re
         statuses = re.findall(r'^HTTP/\S+\s+(\d{3})', result.stdout, re.M)

@@ -81,7 +81,7 @@ test('room goal checkpoints and continues with linked tool evidence',async({page
 
 test('invalid workspace tool arguments recover without repeating execution',async({page})=>{
   await page.setViewportSize({width:1440,height:900});
-  await page.getByLabel('Message',{exact:true}).fill('Run workspace recovery and read the actual notes file');
+  await page.getByLabel('Message',{exact:true}).fill('Read workspace file recovery-notes.txt');
   await page.getByRole('button',{name:'RUN',exact:true}).click();
   await expect(page.locator('.message.assistant').last()).toContainText('controlled workspace evidence');
   await expect(page.locator('.message.assistant').last()).toContainText('No remote file access');
@@ -90,6 +90,50 @@ test('invalid workspace tool arguments recover without repeating execution',asyn
   await expect(page.locator('.tool-card.success').filter({hasText:'workspace.read'})).toHaveCount(1);
   await page.reload();
   await expect(page.locator('.message.assistant').last()).toContainText('controlled workspace evidence');
+});
+
+test('a delayed send preserves the draft in another session', async ({page}) => {
+  const composer = page.getByLabel('Message', {exact: true});
+  const run = page.getByRole('button', {name: 'RUN', exact: true});
+  const terminal = page.locator('.pane-title').filter({hasText: 'TERMINAL / CHAT'});
+  async function nameSession(message: string) {
+    await composer.fill(message);
+    await run.click();
+    const row = page.locator('.session-row').filter({hasText: message});
+    await expect(row).toHaveClass(/active/);
+    await expect(terminal).toContainText('Completed');
+    return row;
+  }
+  const first = await nameSession('Hello from session one');
+  await page.getByRole('button', {name: '+ New session', exact: true}).click();
+  await expect(page.getByRole('heading', {name: 'READY // WAITING FOR INPUT'})).toBeVisible();
+  const second = await nameSession('Hello from session two');
+  await composer.fill('Draft in the new session');
+  await first.click();
+  await expect(first).toHaveClass(/active/);
+  await composer.fill('Another message in session one');
+
+  let received = () => {};
+  let release = () => {};
+  const intercepted = new Promise<void>(resolve => { received = resolve; });
+  const delay = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/sessions/*/messages', async route => {
+    received();
+    await delay;
+    await route.continue();
+  });
+
+  await run.click();
+  try {
+    await intercepted;
+    await second.click();
+    await expect(second).toHaveClass(/active/);
+    await expect(composer).toHaveValue('Draft in the new session');
+  } finally {
+    release();
+  }
+  await expect(composer).toBeEnabled();
+  await expect(composer).toHaveValue('Draft in the new session');
 });
 
 test('journal reconnect does not rerun a finished tool',async({page,context})=>{

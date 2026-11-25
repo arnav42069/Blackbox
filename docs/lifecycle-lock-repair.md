@@ -1,93 +1,89 @@
-# Lifecycle lock repair
+# Lifecycle ownership repair — 2026-11-10
 
-## Root cause
+## Confirmed cause
 
-A disposable backend launched through `.venv/bin/python3` reproduced the reported
-`server.lock` error when controlled through `.venv/bin/python`. Discovery compared
-the interpreter spelling rather than recognizing aliases in the same environment.
-It rejected the genuine lock-owning backend, then attempted stale cleanup by
-acquiring that backend's occupied lifetime lock. No shutdown signal was reached.
-The original regression failed before the fix (1 failed in 1.14 seconds).
+The actual installed launcher is `~/.local/bin/blackbox`, a shell wrapper that
+executes this checkout's editable `.venv/bin/blackbox`. Its Python entrypoint is
+`blackbox.cli:main`; the CLI acquires `server.lock`, writes `instance.json`, then
+runs Uvicorn in that same process. No additional Uvicorn worker owns this instance.
 
-The normal data directory had no live backend or lock holder when inspected during
-this repair; the earlier process's exact launch command therefore cannot be proven.
-Global `/proc/locks` ownership also supplied an unnecessarily fragile identity
-check for inherited descriptors and PID namespaces.
+Read-only inspection found the reported failure on live backend PID 1601688.
+Its start time, executable, exact CLI command, private instance record and open
+lock descriptor all matched. `lslocks` showed its active flock. However:
 
-## Changes
+- `stat(server.lock)` and `stat(/proc/1601688/fd/4)` both reported device `00:36`,
+  inode 970863.
+- `/proc/1601688/fdinfo/4` reported `FLOCK ADVISORY WRITE 1601688 00:1d:970863`.
 
-- Recognize equivalent interpreter aliases within the installed environment.
-- Prove the live process holds the exact private `server.lock` inode using its
-  `/proc/<pid>/fdinfo` flock entry. Opening a file alone is insufficient.
-- Serialize lifecycle operations with `lifecycle.lock`, separate from the backend's
-  lifetime `server.lock`. Wait at most five seconds for another operation, then
-  report the holder PID and lock role. Never unlink lock files.
-- Stop the independently verified backend through a pidfd, rechecking identity
-  before SIGTERM and escalating after three seconds if necessary. Acquire the
-  instance lock for cleanup only after the backend exits.
-- Register startup identity and release the startup operation mutex before slow
-  application initialization, so a starting backend remains stoppable.
-- Handle legacy `control.lock`: ignore it only when held solely by the verified
-  backend being stopped; wait boundedly for a separate legacy controller.
-- Recover a provably expired registration only from a separately verified live
-  backend/lock owner. Never use the stale PID as authority to send a signal.
+Btrfs reports a subvolume device through stat and its superblock device through
+kernel lock information. Comparing those device numbers rejected the real backend.
+Discovery silently discarded it, then stale cleanup attempted to acquire its
+occupied lock and printed the misleading invisible-owner error.
 
-No QA orchestrator, tool policy, pairing mechanism, scope checks, or dependency
-installation logic was changed. Restart continues generating a fresh backend
-session and pairing credentials.
+The regression test reproduces that device mismatch without requiring Btrfs. It
+failed before the fix. Descriptor verification now compares the actual open
+file's device and inode against the private lock path, and checks the descriptor's
+own exclusive flock and inode without comparing the Btrfs superblock device.
+A descriptor merely opening the file still provides no ownership proof.
+
+## Resulting behavior
+
+`kill` signals the verified backend through a pidfd, waits three seconds after
+SIGTERM, rechecks process identity and escalates only if necessary. It never waits
+for an owned server lock to become free before sending SIGTERM. The lock's inode
+is never unlinked. Lifetime ownership and lifecycle-operation locking remain
+separate. Process identity includes PID, kernel start time, executable, exact
+command and, for new registrations, boot and instance identifiers. Reparenting
+does not invalidate a process identity.
+
+`restart` waits for exit, port release and lock availability, then confirms the
+fresh instance's HTTP health identity. A stale or unrelated health response cannot
+confirm a replacement. Existing data, sessions and checkpoints remain subject to
+the application's existing recovery and retention behavior.
+
+`status [--json]` independently reports verified process identity, the actual
+flock probe and visible owners, lifecycle lock, listening/bind state and HTTP
+health. A hidden owner still reports a held lock. Inaccessible identity fails
+closed with an actionable diagnostic; it never authorizes a guessed signal.
+Older backends can report healthy HTTP responses without an instance identifier;
+status exposes that distinction. Fresh restart confirmation requires the new ID.
+
+Fixed tools receive exact instance/data-directory markers. Detached or orphaned
+tools can be pinned and cleaned up after a crash; untagged unrelated processes are
+excluded. User services are recognized only when the verified backend is their
+MainPID and its cgroup matches the manager. Explicit manager stop suppresses
+`Restart=always`; a live D-Bus unit reference also retains transient units between
+stop and start. Replacement health is confirmed within the same user service.
+CLI option changes for services require updating the unit's ExecStart first.
+
+The supported development launcher now uses the registered CLI backend and keeps
+Vite's watched frontend build. Use `blackbox restart` for Python changes. Arbitrary
+unregistered Uvicorn/reload processes remain outside managed discovery.
 
 ## Validation
 
-All lifecycle integration tests use explicit temporary data directories and
-disposable processes. No developer backend was terminated.
+All shutdown/restart acceptance checks used disposable data and processes. The
+original user backend was inspected without receiving any signal.
 
-```bash
-.venv/bin/python -m pytest -q tests/unit/test_processes.py tests/integration/test_cli_lifecycle.py --junitxml=qa-reports/lifecycle-lock-focused.xml
-.venv/bin/python -m pytest -q --junitxml=qa-reports/lifecycle-lock-backend.xml
-cd frontend
-npm test
-npm run build
-npm run test:e2e
-npm run test:e2e -- --grep 'authorized lab inspection' --repeat-each=3
-```
+- Final full Python unit/integration/QA suite: **367 passed, 2 skipped**, 94.95
+  seconds. Both skips are opt-in live Ollama inference tests requiring
+  `BLACKBOX_LIVE_OLLAMA_MODEL`.
+- All **83 lifecycle tests** passed in that final run, covering active/stale locks,
+  Btrfs device mismatch, hidden owners, permission failures, PID/command/boot/instance
+  changes, graceful and forced shutdown, detached orphans, restart races, status,
+  user-service ownership and reference lifetime, health identity, and preservation
+  of committed attachments, files, sessions and execution checkpoints.
+- Installed launcher on this checkout's Btrfs filesystem: start/status/restart/kill
+  passed; PID 1645213 became 1645340, health ID changed, and lock inode 1114520 stayed
+  unchanged.
+- Actual transient systemd user service with `Restart=always`: restart changed PID
+  1645562 to 1645644, retained service ownership, confirmed new health and stopped
+  into `inactive` without respawning.
+- `bash -n scripts/dev.sh` and `git diff --check` for all task-owned files passed.
+  The separately edited `codex-prompts.md` was preserved; the global whitespace
+  check reports trailing whitespace in that unrelated file.
 
-Focused lifecycle suite: **61 passed** (32.51 seconds). Coverage includes occupied
-locks, interpreter aliases, inherited flock descriptors, legacy backend/controller
-locks, stale registration, PID reuse, permission failures, unrelated processes,
-SIGKILL escalation, multiple data directories, blocked startup, restart after
-shutdown, and concurrent restart/kill without duplicate or orphan backends.
-
-Frontend unit tests: **12 passed**. Type checking and production build passed.
-The first browser run had **16 passed, 1 failed**: the authorized inspection test
-entered text before the asynchronous authorization dialog had closed and timed
-out on disabled RUN. Both scope-setting tests now wait for the dialog to close;
-the affected inspection test passed **3/3 repeated runs**.
-
-Installed-launcher acceptance also passed from `/`, using
-`/home/arnav/.local/bin/blackbox` and a temporary data/config directory:
-restart replaced PID 984449 with PID 984514, preserved model and port 36265,
-generated a different pairing token, and retained the same lock inode. Kill used
-SIGTERM, released the port, and left no backend; a second kill correctly reported
-no running instance. Pairing tokens were redacted from captured output.
-
-Final full-suite reruns: **314 backend tests passed** (68.90 seconds), including
-all 61 lifecycle cases; **17 browser tests passed** (17.1 seconds). No tests failed
-or were skipped in either final run. `git diff --check` also passed.
-
-## Files and installation
-
-Repair files: `backend/blackbox/processes.py`, `backend/blackbox/cli.py`,
-`tests/unit/test_processes.py`, `tests/integration/test_cli_lifecycle.py`,
-`tests/e2e/chat-tool-loop.spec.ts` (authorization synchronization only), `README.md`,
-`docs/cli-process-management.md`, and this report.
-
-The installed launcher resolves to this checkout's editable environment, so no
-reinstall or rebuild is required for these Python CLI changes. A currently running
-backend retains its old loaded code until restarted; the updated controller can
-identify and stop compatible pre-upgrade backends.
-
-Linux `/proc` visibility and pidfd support remain required. If process identity
-cannot be verified, shutdown fails closed with an owner diagnostic. A separate
-lifecycle operation exceeding the five-second contention window requires a retry.
-No claim is made about stopping the user's previously reported process because it
-was no longer running when this investigation began.
+JUnit evidence: `qa-reports/lifecycle-v2-focused.xml` and
+`qa-reports/lifecycle-v2-full.xml`; installed/service acceptance evidence is in
+`qa-reports/lifecycle-v2-acceptance.json`. Pairing credentials are not included in this
+report. No dependencies were installed and no user service files were modified.

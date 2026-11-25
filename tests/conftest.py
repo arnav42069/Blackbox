@@ -67,6 +67,9 @@ def settings(tmp_path):
 @pytest_asyncio.fixture
 async def app(settings, mock_ollama):
     app = create_app(settings, httpx.MockTransport(mock_ollama))
+    # Most integration tests exercise already-verified tool and image workflows.
+    app.state.db.execute('INSERT INTO model_capabilities VALUES (?,?,?,?,?)',
+        ('fixture-digest','fixture:4b',json.dumps({'capabilities':['completion','vision','tools'],'details':{}}),json.dumps({'vision':True,'tools':True}),0))
     yield app
     await app.state.agent.shutdown()
     await app.state.ollama.close()

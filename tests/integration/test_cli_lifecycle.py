@@ -251,7 +251,7 @@ def test_concurrent_restart_does_not_duplicate(backends):
 def test_help_and_offline_doctor_are_backward_compatible(tmp_path):
     data=tmp_path/'data'
     result=command(data,'--help')
-    assert result.returncode==0 and '{doctor,kill,restart}' in result.stdout
+    assert result.returncode==0 and '{doctor,kill,restart,status}' in result.stdout
     assert not data.exists()
     # Own this port without listening: connection refused, no unrelated Ollama contacted.
     with socket.socket() as sock:
@@ -347,3 +347,104 @@ def test_kill_waits_for_concurrent_restart_without_duplicate(backends):
             if child and child.poll() is None:
                 child.kill()
                 child.wait(timeout=3)
+
+
+def test_status_reports_process_lock_port_and_instance_health(backends):
+    data,_,port,process,_=backends()
+    result=command(data,'status','--json')
+    assert result.returncode==0,result.stderr
+    report=json.loads(result.stdout)
+    assert report['state']=='running'
+    assert report['process']['pid']==process.pid and report['process']['verified']
+    assert report['lock']['held'] and process.pid in report['lock']['owners']
+    assert report['port']=={'number':port,'available':False,'listening':True}
+    assert report['health']['ok'] and report['health']['instance_matches']
+    assert report['health']['reported_instance_id']==json.loads((data/'instance.json').read_text())['id']
+    assert command(data,'kill').returncode==0
+    stopped=command(data,'status','--json','--port',str(port))
+    report=json.loads(stopped.stdout)
+    assert report['state']=='stopped' and report['lock']['held'] is False
+    assert report['port']['available'] and report['health']['ok'] is False
+
+
+def test_status_never_creates_missing_data_directory(tmp_path):
+    data=tmp_path/'missing'
+    result=command(data,'status','--json','--port',str(free_port()))
+    assert result.returncode==0,result.stderr
+    assert json.loads(result.stdout)['state']=='stopped'
+    assert not data.exists()
+
+
+def test_status_reports_unknown_lock_owner_without_removing_lock(tmp_path):
+    data=tmp_path/'data'
+    data.mkdir(mode=0o700)
+    with manager.file_lock(data/'server.lock'):
+        inode=(data/'server.lock').stat().st_ino
+        result=command(data,'status','--json','--port',str(free_port()))
+        report=json.loads(result.stdout)
+        assert result.returncode==1
+        assert report['state']=='unverified' and report['lock']['held']
+        assert report['process']['verified'] is False
+        assert manager.lock_owned(data/'server.lock',os.getpid())
+        assert (data/'server.lock').stat().st_ino==inode
+
+
+def test_restart_retains_files_sessions_and_execution_checkpoints(backends):
+    import sqlite3
+    data,_,_,old,_=backends()
+    expected={folder:b'preserve\x00checkpoint\xff' for folder in ('workspace','artifacts','attachments')}
+    for folder,content in expected.items():
+        (data/folder/'keep.bin').write_bytes(content)
+    checkpoint={'status':'checkpointed','checkpoint':{'reason':'budget','tool_calls':7},'pending':{'tool':'web.inspect'},'verified_findings':['retained']}
+    with sqlite3.connect(data/'blackbox.db') as db:
+        db.execute("INSERT INTO sessions(id,title,model,status,created_at,updated_at) VALUES ('retained-session','retained','fixture:original','idle',?,?)",(time.time(),time.time()))
+        db.execute("INSERT INTO attachments(id,session_id,path) VALUES ('retained-attachment','retained-session',?)",(str(data/'attachments'/'keep.bin'),))
+        db.execute('INSERT INTO task_goals(session_id,payload_json,updated_at) VALUES (?,?,0)',('retained-session',json.dumps(checkpoint)))
+    inode=(data/'server.lock').stat().st_ino
+    result=command(data,'restart')
+    assert result.returncode==0,result.stderr
+    old.wait(timeout=5)
+    assert 'health confirmed' in result.stdout
+    assert (data/'server.lock').stat().st_ino==inode
+    for folder,content in expected.items():
+        assert (data/folder/'keep.bin').read_bytes()==content
+    with sqlite3.connect(data/'blackbox.db') as db:
+        assert db.execute("SELECT title FROM sessions WHERE id='retained-session'").fetchone()==('retained',)
+        assert json.loads(db.execute("SELECT payload_json FROM task_goals WHERE session_id='retained-session'").fetchone()[0])==checkpoint
+
+
+def test_stale_instance_cleans_only_its_tagged_orphaned_tool(tmp_path):
+    import shutil
+    data=tmp_path/'data'
+    data.mkdir(mode=0o700)
+    fifo=tmp_path/'tool-input'
+    os.mkfifo(fifo)
+    marker='test-orphan-instance'
+    env={**environment(),'BLACKBOX_INSTANCE_ID':marker,'BLACKBOX_INSTANCE_DATA':str(data)}
+    script="""
+import json,os,subprocess,sys
+from blackbox.processes import inspect
+parent=inspect(os.getpid())
+child=subprocess.Popen([sys.argv[1],sys.argv[2]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+print(json.dumps({'pid':parent.pid,'start':parent.start,'child':child.pid}),flush=True)
+"""
+    parent=subprocess.run([sys.executable,'-c',script,shutil.which('cat'),str(fifo)],env=env,capture_output=True,text=True,timeout=5)
+    assert parent.returncode==0,parent.stderr
+    identity=json.loads(parent.stdout)
+    unrelated=subprocess.Popen([shutil.which('cat'),str(fifo)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    child_fd=os.pidfd_open(identity['child'])
+    try:
+        manager.atomic_write(data/'instance.json',json.dumps({'id':marker,'pid':identity['pid'],'start':identity['start'],
+            'source':str(manager.PACKAGE),'data_dir':str(data)}).encode())
+        result=command(data,'kill')
+        assert result.returncode==0,result.stderr
+        assert manager.exited(child_fd,2)
+        assert unrelated.poll() is None
+        assert not (data/'instance.json').exists()
+    finally:
+        if not manager.exited(child_fd,0):
+            import signal
+            manager.signal_fd(child_fd,signal.SIGKILL)
+        os.close(child_fd)
+        unrelated.terminate()
+        unrelated.wait(timeout=3)

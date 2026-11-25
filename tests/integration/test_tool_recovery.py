@@ -11,6 +11,7 @@ from blackbox.tools import workspace
 from conftest import call
 from test_api import new,finish
 from test_tools import context
+from scripts.qa_support import agent_findings
 
 
 async def test_all_registered_tools_have_strict_validated_examples(app):
@@ -100,6 +101,78 @@ async def test_repeated_bad_workspace_call_recovers_by_listing(client,app,mock_o
     assert observations[1]['error']['code']=='IDENTICAL_FAILURE_SUPPRESSED'
     assert any(o.get('stdout')=='REAL LOCAL CONTENT' for o in observations)
     assert 'No remote file access' in app.state.db.messages(sid)[-1]['content']
+
+
+async def test_local_workspace_workflow_recovers_and_reports_verified_content(
+        client, app, mock_ollama, monkeypatch, record_property):
+    sid = await new(client)
+    note = 'Maintenance window: Thursday at 18:00.'
+    (app.state.settings.data_dir/'workspace/maintenance-backup.txt').write_text(note)
+    reads = []
+    spec = app.state.agent.registry.specs['workspace.read']
+    original = spec.run
+
+    async def read(ctx, args):
+        reads.append(args.path)
+        if args.path == 'maintenance.txt':
+            raise TimeoutError('Controlled workspace read timeout')
+        result = await original(ctx, args)
+        assert result.ok
+        mock_ollama.replies.append({'content': result.stdout})
+        return result
+
+    monkeypatch.setattr(spec, 'run', read)
+    mock_ollama.replies = [
+        call('workspace.read', path='../invalid.txt'),
+        call('workspace.read', path='../invalid.txt'),
+        call('workspace.list', path='.'),
+        call('workspace.read', path='maintenance.txt'),
+        call('workspace.read', path='maintenance-backup.txt'),
+    ]
+    response = await client.post(f'/api/sessions/{sid}/messages', data={'text': 'Read workspace file maintenance-backup.txt'})
+    assert response.status_code == 200
+    assert (await finish(app, sid))['status'] == 'completed'
+    messages = app.state.db.messages(sid)
+    observations = [json.loads(message['content']) for message in messages if message['role'] == 'tool']
+    assert len(observations) == 5
+    assert [o['error']['kind'] for o in observations if not o['ok']] == ['validation', 'validation', 'transient']
+    assert observations[1]['error']['code'] == 'IDENTICAL_FAILURE_SUPPRESSED'
+    assert reads == ['maintenance.txt', 'maintenance-backup.txt']
+    final = messages[-1]
+    assert final['metadata']['conversation_kind'] == 'final'
+    assert observations[2]['evidence'][0]['path'] == 'maintenance-backup.txt'
+    assert observations[-1]['stdout'] == note
+    assert final['content'].splitlines()[0] == note
+    assert observations[-1]['tool_id'] in final['content']
+    provider_tool_message = mock_ollama.requests[-1]['messages'][-1]
+    assert provider_tool_message['role'] == 'tool'
+    assert json.loads(provider_tool_message['content'])['stdout'] == note
+
+    db = app.state.db
+    assert not db.session(sid)['scope']
+    events = db.events(sid)
+    tools = db.rows('SELECT * FROM tool_events ORDER BY started_at')
+    assert {tool['tool_name'] for tool in tools} == {'workspace.read', 'workspace.list'}
+    assert len(tools) == len(observations)
+    assert events[-1]['type'] == 'run_finished' and events[-1]['reason'] == 'completed'
+    assert not agent_findings(events, tools, required_tools=('workspace.read', 'workspace.list'),
+                              expected_text=note, final_text=final['content'], terminal='completed')
+
+    executions = [(e['name'], e['args']['path']) for e in events if e['type'] == 'tool_started']
+    assert executions == [('workspace.list', '.'), ('workspace.read', 'maintenance.txt'),
+                          ('workspace.read', 'maintenance-backup.txt')]
+    record_property('objective_completion_rate', '1/1 (100%)')
+    record_property('tool_outcomes', len(observations))
+    record_property('successful_executions', sum(tool['status'] == 'success' for tool in tools))
+    record_property('executions', len(executions))
+    record_property('redundant_executions', len(executions) - len(set(executions)))
+    record_property('duplicate_proposals_suppressed', sum(o['error']['code'] == 'IDENTICAL_FAILURE_SUPPRESSED'
+                                                          for o in observations if not o['ok']))
+    record_property('recovered_validation_errors', sum(o['error']['kind'] == 'validation'
+                                                      and o['error']['code'] != 'IDENTICAL_FAILURE_SUPPRESSED'
+                                                      for o in observations if not o['ok']))
+    record_property('recovered_transient_failures', sum(o['error']['kind'] == 'transient'
+                                                       for o in observations if not o['ok']))
 
 
 async def test_repeated_http_connection_failure_is_not_reexecuted(client,app,mock_ollama,monkeypatch):
