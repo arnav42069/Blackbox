@@ -290,6 +290,99 @@ async def test_think_option_rejection_retries_without_private_trace(app,mock_oll
     assert len(requests)==2 and public==['Visible']
 
 
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize(('status', 'provider_error'), [
+    (400, {'json': {'error': '"text:test" does not support thinking'}}),
+    (400, {'json': {'error': 'think is not supported'}}),
+    (400, {'text': 'text:test does not support thinking'}),
+    (422, {'json': {'error': {'message': "Unknown request parameter: 'think'"}}}),
+    (422, {'text': "This model doesn't support the option 'think'."}),
+])
+async def test_think_option_rejection_is_model_and_digest_specific(app, stream, status, provider_error):
+    ollama = app.state.ollama
+    await ollama.http.aclose()
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append((body['model'], body.get('think')))
+        if len(requests) == 1:
+            return httpx.Response(status, **provider_error)
+        return httpx.Response(200, json={'done': True, 'message': {'content': 'Visible'}})
+
+    ollama.http = httpx.AsyncClient(base_url='http://fixture', transport=httpx.MockTransport(handler))
+    ollama.cache = [{'name': 'text:test', 'digest': 'digest-1'}, {'name': 'reasoning:test', 'digest': 'digest-2'}]
+    ollama.settings.prefs.think = True
+    send = ollama.chat_stream if stream else ollama.chat
+    other_path = ollama.chat if stream else ollama.chat_stream
+    assert (await send('text:test', []))['message']['content'] == 'Visible'
+    assert ollama.models_without_think == {'text:test': 'digest-1'}
+    await other_path('text:test', [])
+    await send('reasoning:test', [])
+    ollama.cache[0]['digest'] = 'replacement'
+    await send('text:test', [])
+    assert requests == [
+        ('text:test', True), ('text:test', None), ('text:test', None),
+        ('reasoning:test', True), ('text:test', True),
+    ]
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize(('status', 'provider_error'), [
+    (503, {'json': {'error': 'thinking worker temporarily unavailable'}}),
+    (503, {'text': 'thinking worker temporarily unavailable'}),
+    (503, {'json': {'error': {'message': 'thinking worker temporarily unavailable'}}}),
+    (503, {'json': {'error': 'think is not supported'}}),
+    (400, {'json': {'error': 'thinking worker temporarily unavailable'}}),
+    (400, {'json': {'error': 'Invalid prompt: input contains the literal text "fixture does not support thinking"'}}),
+    (400, {'json': {'error': '"another-model" does not support thinking'}}),
+    (400, {'text': 'Invalid prompt: "fixture" does not support thinking'}),
+    (422, {'json': {'error': {'message': '"Fixture" does not support thinking'}}}),
+])
+async def test_thinking_provider_error_preserves_request_flags_and_cache(app, stream, status, provider_error):
+    ollama = app.state.ollama
+    await ollama.http.aclose()
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(status, **provider_error)
+        return httpx.Response(200, json={'done': True, 'message': {'content': 'Recovered'}})
+
+    ollama.http = httpx.AsyncClient(base_url='http://fixture', transport=httpx.MockTransport(handler))
+    ollama.cache = installed = [{'name': 'fixture', 'digest': 'current'}]
+    ollama.models_without_think['fixture'] = 'older'
+    ollama.settings.prefs.think = True
+    send = ollama.chat_stream if stream else ollama.chat
+    with pytest.raises(OllamaError, match=f'Ollama HTTP {status}'):
+        await send('fixture', [])
+    assert len(requests) == 1
+    assert (await send('fixture', []))['message']['content'] == 'Recovered'
+    assert [request['think'] for request in requests] == [True, True]
+    assert ollama.cache is installed
+    assert ollama.models_without_think == {'fixture': 'older'}
+
+
+async def test_negotiating_thinking_does_not_spend_transport_retry(app):
+    await app.state.ollama.http.aclose()
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(400, json={'error': 'think is not supported'})
+        if len(requests) == 2:
+            raise httpx.ReadTimeout('controlled timeout')
+        return httpx.Response(200, stream=Chunks([{'message': {'content': 'Recovered'}, 'done': True}]))
+
+    app.state.ollama.http = httpx.AsyncClient(base_url='http://fixture', transport=httpx.MockTransport(handler))
+    response = await app.state.ollama.chat_stream('text:test', [])
+    assert response['message']['content'] == 'Recovered'
+    assert ['think' in body for body in requests] == [True, False, False]
+
+
 async def test_goal_budget_checkpoint_and_continuation_preserve_real_evidence(client,app,monkeypatch):
     from blackbox.tools.base import ToolResult
     from blackbox.core.scans import Finding
