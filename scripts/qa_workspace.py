@@ -83,8 +83,8 @@ def main():
     }
     backend_report = report / 'backend.xml'
     npm = ['npm', '--prefix', 'frontend']
-    browser_tests = ('workspace tool arguments|journal reconnect|Stop cancels|Retry starts|'
-                     'page snapshots fail|restored missing model|restored session|clipboard|screenshot-only|capability probe')
+    browser_tests = ('workspace tool arguments|journal reconnect|Stop cancels|Retry starts|delayed send|'
+                     'session snapshots fail|restored missing model|restored session|clipboard|screenshot-only|capability probe')
     print('Workspace QA artifacts:', report, flush=True)
     def run(command):
         print('Running:', shlex.join(command), flush=True)

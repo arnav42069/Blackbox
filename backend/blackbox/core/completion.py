@@ -8,7 +8,7 @@ from ..tools.base import Arguments
 
 _LOCAL_FILE = re.compile(
     r'\s*(?:read|open|view)\s+(?:the\s+)?(?P<workspace>(?:local\s+)?workspace\s+)?'
-    r'(?:file\s+)?(?P<path>`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\'|[\w./~-]+)'
+    r'(?P<file>file\s+)?(?P<path>`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\'|[\w./~-]+)'
     r'(?P<suffix>\s+(?:from|in)\s+(?:the\s+)?(?:local\s+)?workspace)?', re.I,
 )
 _NEXT_LOCAL_FILE = re.compile(r'\s*(?:[;,]\s*|\s+(?:and|then)\s+)', re.I)
@@ -30,6 +30,8 @@ def named_workspace_reads(instruction):
             path = raw[1:-1]
         else:
             path = raw.removesuffix('.') if match.end() == len(instruction) else raw
+            if not (match['file'] or '.' in path or '/' in path):
+                break
         paths.append(path)
         if _LOCAL_FILE_END.fullmatch(instruction, match.end()):
             return paths

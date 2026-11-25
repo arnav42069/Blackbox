@@ -135,13 +135,28 @@ export function App() {
   }
   async function send(e?:Event,instruction?:string){
     const message=instruction ?? text;
-    e?.preventDefault();if(!current || busy || (!message.trim()&&!images.length))return;
-    if(images.length&&!capability?.vision&&!models.some(m=>m.name===prefs?.vision_model&&m.vision)){setError(capability?.probes?.diagnostics?.vision?.message || (capability?.vision_advertised?'Vision is advertised but not verified. Open Settings and select Probe capabilities.':'The selected model does not advertise vision. Select a vision-capable model.'));return;}
+    const fromComposer=instruction===undefined;
+    const attachments=fromComposer?images:[];
+    e?.preventDefault();if(!current || busy || (!message.trim()&&!attachments.length))return;
+    if(attachments.length&&!capability?.vision&&!models.some(m=>m.name===prefs?.vision_model&&m.vision)){setError(capability?.probes?.diagnostics?.vision?.message || (capability?.vision_advertised?'Vision is advertised but not verified. Open Settings and select Probe capabilities.':'The selected model does not advertise vision. Select a vision-capable model.'));return;}
     const sid=current.id;
     setError('');setSending(true);
-    const form=new FormData();form.append('text',message);if(!instruction)images.forEach(i=>form.append('images',i.file));
-    try {await api(`/sessions/${sid}/messages`,{method:'POST',body:form});changeText('');setImages(old=>{old.forEach(i=>URL.revokeObjectURL(i.url));return [];});const s=await api(`/sessions/${sid}`);if(currentID.current===sid)setCurrent(reconciled(s));await refreshSessions();}
-    catch(e){setError(String(e));}finally{setSending(false);}
+    const form=new FormData();
+    form.append('text',message);
+    attachments.forEach(image=>form.append('images',image.file));
+    try {
+      await api(`/sessions/${sid}/messages`,{method:'POST',body:form});
+      if(fromComposer){
+        delete draft.current[sid];
+        if(currentID.current===sid){
+          setText('');
+          setImages(old=>{old.forEach(image=>URL.revokeObjectURL(image.url));return [];});
+        }
+      }
+      await refreshCurrent(sid);
+      await refreshSessions();
+    }catch(e){if(currentID.current===sid)setError(String(e));}
+    finally{setSending(false);}
   }
   async function stop(){
     if(!current)return;
