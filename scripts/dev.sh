@@ -8,4 +8,6 @@ ui_pid=$!
 cleanup() { kill "$ui_pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 # A single origin preserves production Host/Origin checks and CSP. Reload browser after UI rebuild.
-.venv/bin/python -m uvicorn scripts.dev_server:factory --factory --host 127.0.0.1 --port 8765 --reload --reload-dir backend --reload-dir scripts
+# Use the same registered, single-instance backend as production. Vite continues
+# watching UI assets; use blackbox restart after Python changes.
+.venv/bin/python -m blackbox "$@"

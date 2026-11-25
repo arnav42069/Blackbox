@@ -90,7 +90,8 @@ def create_app(settings: Settings | None = None, transport=None):
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.1.0"}
+        record=getattr(app.state,'instance_record',{})
+        return {"ok": True, "version": "0.1.0", "instance_id":record.get('id'), "pid":record.get('pid')}
 
     @app.post("/api/pair")
     async def pair(body: Pair):
