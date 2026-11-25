@@ -81,7 +81,7 @@ test('room goal checkpoints and continues with linked tool evidence',async({page
 
 test('invalid workspace tool arguments recover without repeating execution',async({page})=>{
   await page.setViewportSize({width:1440,height:900});
-  await page.getByLabel('Message',{exact:true}).fill('Run workspace recovery and read the actual notes file');
+  await page.getByLabel('Message',{exact:true}).fill('Read workspace file recovery-notes.txt');
   await page.getByRole('button',{name:'RUN',exact:true}).click();
   await expect(page.locator('.message.assistant').last()).toContainText('controlled workspace evidence');
   await expect(page.locator('.message.assistant').last()).toContainText('No remote file access');

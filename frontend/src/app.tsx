@@ -42,6 +42,12 @@ export function App() {
   const state=executionState(current?.status,events);
   const goalPhase=events.findLast(e=>e.type==='goal_state'&&e.goal_id===current?.task_goal?.id);
   const capability=models.find(m=>m.name===current?.model);
+  const visionStatus=capability?.vision ? 'Vision verified' : !capability?.vision_advertised ? 'Vision unsupported' : capability?.probes?.diagnostics?.vision ? `Vision supported · Probe failed: ${capability.probes.diagnostics.vision.message}` : 'Vision supported · Probe pending';
+  const modelStatus=!connected||current?.model_availability?.status==='unknown'
+    ? 'Model availability unknown'
+    : capability
+      ? `${visionStatus} · ${capability.tools?'Tools verified':capability.tools_advertised?'Tools unverified':'Tools unsupported'} · ${capability.source}`
+      : 'Model not installed — select an installed model';
 
   useEffect(()=>{
     const fragment=new URLSearchParams(location.hash.slice(1));
@@ -51,12 +57,34 @@ export function App() {
   useEffect(()=>{imageRef.current=images;},[images]);
   useEffect(()=>()=>{imageRef.current.forEach(i=>URL.revokeObjectURL(i.url));},[]);
   async function refreshModels(){
-    const p=await api('/preflight');setConnected(p.ollama.connected);setConnection(p.ollama.message);
+    const p=await api('/preflight');
     setDependencyMessages(p.dependencies?.messages || []);
     setProtocolWarning(p.conversation_protocol===1?'':'The running backend lacks the current conversation streaming protocol. Run blackbox restart and open its new pairing link, then reload this page.');
-    if(p.ollama.connected)setModels(await api('/models'));else setModels([]);
+    let installed: {name:string}[] | undefined;
+    let message=p.ollama.message;
+    if(p.ollama.connected){
+      try {installed=await api('/models');}
+      catch(e){message=String(e);}
+    }
+    setConnected(installed!==undefined);
+    setConnection(message);
+    setModels(installed ?? []);
+    const alternatives=installed?.map(model=>model.name) ?? [];
+    setCurrent((old:any)=>{
+      if(!old)return old;
+      const model_availability=!installed
+        ? {status:'unknown',message,alternatives}
+        : alternatives.includes(old.model)
+          ? {status:'available'}
+          : {status:'missing',message:`Saved model ${old.model} is unavailable. Select an installed alternative explicitly.`,alternatives};
+      return {...old,model_availability};
+    });
   }
   async function refreshSessions(){setSessions(await api('/sessions'));}
+  async function refreshCurrent(sid:string){
+    const snapshot=await api(`/sessions/${sid}`);
+    if(currentID.current===sid)setCurrent(reconciled(snapshot));
+  }
   async function select(sid:string){
     const request=++selectionRequest.current;
     try {const value=await api(`/sessions/${sid}`);if(request!==selectionRequest.current)return;currentID.current=sid;follow.current=true;setCurrent(reconciled(value));setEvents(value.events);setText(draft.current[sid] || '');setImages(old=>{old.forEach(i=>URL.revokeObjectURL(i.url));return [];});setSessionsOpen(false);}
@@ -108,30 +136,50 @@ export function App() {
   async function send(e?:Event,instruction?:string){
     const message=instruction ?? text;
     e?.preventDefault();if(!current || busy || (!message.trim()&&!images.length))return;
-    if(images.length&&!capability?.vision&&!models.some(m=>m.name===prefs?.vision_model&&m.vision)){setError('Select and probe a vision-capable model before sending images.');return;}
+    if(images.length&&!capability?.vision&&!models.some(m=>m.name===prefs?.vision_model&&m.vision)){setError(capability?.probes?.diagnostics?.vision?.message || (capability?.vision_advertised?'Vision is advertised but not verified. Open Settings and select Probe capabilities.':'The selected model does not advertise vision. Select a vision-capable model.'));return;}
     const sid=current.id;
     setError('');setSending(true);
     const form=new FormData();form.append('text',message);if(!instruction)images.forEach(i=>form.append('images',i.file));
     try {await api(`/sessions/${sid}/messages`,{method:'POST',body:form});changeText('');setImages(old=>{old.forEach(i=>URL.revokeObjectURL(i.url));return [];});const s=await api(`/sessions/${sid}`);if(currentID.current===sid)setCurrent(reconciled(s));await refreshSessions();}
     catch(e){setError(String(e));}finally{setSending(false);}
   }
-  async function stop(){try {await api(`/sessions/${current.id}/cancel`,{method:'POST'});const s=await api(`/sessions/${current.id}`);setCurrent(reconciled(s));}catch(e){setError(String(e));}}
-  async function model(value:string){try {setCurrent(await api(`/sessions/${current.id}`,{method:'PATCH',body:JSON.stringify({model:value})}));await refreshSessions();}catch(e){setError(String(e));}}
+  async function stop(){
+    if(!current)return;
+    const sid=current.id;
+    try {
+      await api(`/sessions/${sid}/cancel`,{method:'POST'});
+      await refreshCurrent(sid);
+    }catch(e){if(currentID.current===sid)setError(String(e));}
+  }
+  async function model(value:string){
+    const sid=current.id;
+    try {
+      const updated=await api(`/sessions/${sid}`,{method:'PATCH',body:JSON.stringify({model:value})});
+      setCurrent((old:any)=>old?.id===sid?{...old,model:updated.model,model_availability:{status:'available'}}:old);
+      await refreshSessions();
+    }catch(e){setError(String(e));}
+  }
   async function removeSession(){if(!current)return;try {await api(`/sessions/${current.id}`,{method:'DELETE'});currentID.current='';setCurrent(null);const list=await api('/sessions');setSessions(list);if(list.length)await select(list[0].id);else await create();}catch(e){setError(String(e));}}
   async function exportSession(){try {const result=await api(`/sessions/${current.id}/export`);const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='blackbox-session.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(e){setError(String(e));}}
   async function retry(){
     if(!current||busy)return;
+    const sid=current.id;
     setSending(true);setError('');
-    try {await api(`/sessions/${current.id}/retry`,{method:'POST'});setCurrent(await api(`/sessions/${current.id}`));await refreshSessions();}
+    try {
+      await api(`/sessions/${sid}/retry`,{method:'POST'});
+      await refreshCurrent(sid);
+      await refreshSessions();
+    }
     catch(e){setError(String(e));}finally{setSending(false);}
   }
   if(!authenticated)return <main class="pair-screen"><h1 class="wordmark">&gt; BLACKBOX_</h1><p>Open the one-use pairing link printed in the server terminal.</p><p>Expired link? Restart <code>blackbox</code> to generate a new one.</p>{error&&<p role="alert" class="error">{error}</p>}<form onSubmit={e=>{e.preventDefault();pair(pairCode).then(()=>setAuthenticated(true)).catch(e=>setError(String(e)));}}><label class="field">Pairing code<input value={pairCode} onInput={e=>setPairCode(e.currentTarget.value)} autoComplete="off"/></label><button class="primary">Pair tab</button></form></main>;
   return <main class={`workbench ${prefs?.visual_effects?'effects':''}`}>
     <header class="topbar"><button class="drawer-toggle" onClick={()=>setSessionsOpen(!sessionsOpen)}>Sessions</button><span class="wordmark">&gt; BLACKBOX_</span><span class="connection"><span class={`led ${connected?'connected':''}`}/>{connected?'OLLAMA CONNECTED':'OLLAMA UNAVAILABLE'}</span><label class="sr-only" for="model">Model</label><select id="model" disabled={busy||!current} value={current?.model} onChange={e=>model(e.currentTarget.value)}>{current&&!models.some(m=>m.name===current.model)&&<option>{current.model}</option>}{models.map(m=><option value={m.name}>{m.name}</option>)}</select><span class="mono mode-label">{prefs?.mode==='manual'?'MANUAL':'AUTO SAFE'}</span><button class="drawer-toggle activity-toggle" onClick={()=>setActivityOpen(!activityOpen)}>Activity</button><button disabled={busy} onClick={()=>setDialog('settings')}>Settings</button></header>
     <div class="panes"><aside class={`sessions ${sessionsOpen?'open':''}`} aria-label="Sessions"><div class="pane-title">[ SESSIONS ]</div><button class="new-session" disabled={sending} onClick={create}>+ New session</button>{sessions.map(s=><button class={`session-row ${current?.id===s.id?'active':''}`} onClick={()=>select(s.id)}><span>{s.title}</span><small>{s.status} · {s.model}</small></button>)}<footer>ROOTLESS // LOCAL FIRST<br/>Tools execute on this host.</footer></aside>
-      <section class="chat" aria-label="Chat"><div class="pane-title">[ TERMINAL / CHAT ] <span class={`caret ${busy?'active':''}`}>{sending?'Thinking':state}</span></div><div class="scope-strip"><div class="row"><span>TARGET {current?.scope?.allowed_targets.join(', ') || 'NONE — authorization required for network tools'}</span><button disabled={!current||busy} onClick={()=>setDialog('scope')}>Scope</button></div><span>{current?.scope?'ATTESTED':'NO SCOPE'} · {usedCalls}/{prefs?.max_tool_calls || 20} tool calls/run · {prefs?.mode==='manual'?'MANUAL':'AUTO SAFE'}</span><div>{capability?`${capability.vision?'Vision':'No verified vision'} · ${capability.tools?'Tools':'No verified tools'} · ${capability.source}`:'Model not installed — select an installed model'}</div></div>
+      <section class="chat" aria-label="Chat"><div class="pane-title">[ TERMINAL / CHAT ] <span class={`caret ${busy?'active':''}`}>{sending?'Thinking':state}</span></div><div class="scope-strip"><div class="row"><span>TARGET {current?.scope?.allowed_targets.join(', ') || 'NONE — authorization required for network tools'}</span><button disabled={!current||busy} onClick={()=>setDialog('scope')}>Scope</button></div><span>{current?.scope?'ATTESTED':'NO SCOPE'} · {usedCalls}/{prefs?.max_tool_calls || 20} tool calls/run · {prefs?.mode==='manual'?'MANUAL':'AUTO SAFE'}</span>{current&&<div>{modelStatus}</div>}</div>
         <div class="transcript" ref={transcript} onScroll={e=>{const el=e.currentTarget;follow.current=el.scrollHeight-el.scrollTop-el.clientHeight<80;}}>
           {(!connected||!models.length)&&<div class="banner">{connection}<p><code>ollama serve</code> · <code>ollama pull qwen3.5:4b</code></p><button onClick={()=>refreshModels().catch(e=>setError(String(e)))}>Retry connection</button></div>}
+          {current?.model_availability?.status!=='available'&&current?.model_availability?.message&&<div class="banner error" role="alert">{current.model_availability.message}{current.model_availability.alternatives?.length>0&&<p>Installed alternatives: {current.model_availability.alternatives.join(', ')}</p>}{connected&&models.length>0&&current.model_availability.status==='missing'&&<button onClick={()=>refreshModels().catch(e=>setError(String(e)))}>Refresh models</button>}</div>}
           {events.some(e=>e.type==='target_context_changed')&&<div class="banner" role="status">Target or authorization changed. Earlier messages retain historical evidence; they are not current findings for the new target.</div>}
           {current?.task_goal&&<details class="goal-status" open><summary>Objective: {current.task_goal.status} · Target {current.task_goal.target}</summary><p>{current.task_goal.instruction}</p><small>{goalPhase?.phase || current.task_goal.phase} · {current.task_goal.verified_findings?.length || 0} observations · {goalPhase?.budget?.tool_calls_remaining ?? current.task_goal.budget?.tool_calls_remaining ?? '—'} tool calls remaining</small>{!busy&&current.task_goal.status!=='completed'&&<button type="button" onClick={()=>send(undefined,'Continue task')}>Continue goal</button>}</details>}
           {displayMessages.length?<Messages sid={current.id} messages={displayMessages} events={events}/>:<div class="empty"><div class="mark">[ &gt;_ ]</div><h1>READY // WAITING FOR INPUT</h1><p>Chat with a local model, paste a screenshot, or configure an authorized lab scope. Every executed tool leaves a visible evidence record.</p></div>}
@@ -149,6 +197,6 @@ export function App() {
       </section><aside class={`activity ${activityOpen?'open':''}`} aria-label="Live activity"><div class="pane-title">[ LIVE ACTIVITY ]<button class="drawer-toggle" onClick={()=>setActivityOpen(false)}>Close</button></div><Activity events={events} sid={current?.id || ''} onError={setError}/></aside>
     </div>
     {dialog==='scope'&&current&&<ScopeDialog sid={current.id} scope={current.scope} close={()=>setDialog('')} saved={setCurrent} error={setError}/>}
-    {dialog==='settings'&&prefs&&<SettingsDialog prefs={prefs} models={models} close={()=>setDialog('')} saved={(v:any)=>{setPrefs(v);if(current && v.model!==current.model)model(v.model);}} error={setError} refresh={refreshModels}/>}
+    {dialog==='settings'&&prefs&&<SettingsDialog prefs={prefs} models={models} selectedModel={current?.model} close={()=>setDialog('')} saved={setPrefs} error={setError} refresh={refreshModels}/>}
   </main>;
 }

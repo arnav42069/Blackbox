@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import httpx
 import uvicorn
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT / 'tests'), str(ROOT)]
 from conftest import MockOllama, call
 from blackbox.app import create_app
 from blackbox.settings import Settings
@@ -22,17 +23,24 @@ class Fixture(MockOllama):
             if body.get('tools', [{}])[0].get('function', {}).get('name')=='agent.review_completion':
                 return super().__call__(request)
             if body['messages'][0].get('content', '').startswith('BLACKBOX_IMAGE_OBSERVATIONS:'):
+                images = body['messages'][0]['images']
+                assert images and all(base64.b64decode(image, validate=True).startswith(b'\x89PNG\r\n\x1a\n')
+                                      for image in images)
                 return super().__call__(request)
             messages=body['messages']
             latest=max(i for i,m in enumerate(messages) if m['role']=='user')
             recent=messages[latest:]
             prompt=recent[0]['content'].lower()
-            if 'workspace recovery' in prompt:
-                count=sum(m['role']=='tool' for m in recent)
-                steps=[call('workspace.read',path='/home/lab/flag.txt'),call('workspace.read',path='/home/lab/flag.txt'),
-                       call('workspace.list',path='.'),call('workspace.read',path='recovery-notes.txt'),
-                       {'content':'Read the actual local notes: controlled workspace evidence. No remote file access was established.'}]
-                self.replies.append(steps[min(count,len(steps)-1)])
+            if prompt == 'read workspace file recovery-notes.txt':
+                observations = [m for m in recent if m['role'] == 'tool']
+                steps = [call('workspace.read', path='../invalid.txt'), call('workspace.read', path='../invalid.txt'),
+                         call('workspace.list', path='.'), call('workspace.read', path='recovery-notes.txt')]
+                if len(observations) < len(steps):
+                    self.replies.append(steps[len(observations)])
+                else:
+                    observed = json.loads(observations[-1]['content'])
+                    assert observed['ok'] and observed['validated_arguments']['path'] == 'recovery-notes.txt'
+                    self.replies.append({'content': f"{observed['stdout']}. No remote file access was established."})
                 return super().__call__(request)
             if not any(m['role']=='tool' for m in recent):
                 if 'preflight' in prompt or 'structured image observations' in prompt:
@@ -79,8 +87,12 @@ if __name__=='__main__':
         path=Path(root)
         port=int(os.environ.get('BLACKBOX_E2E_PORT', '8876'))
         settings=Settings(port=port,data_dir=path/'data',config_dir=path/'config')
+        if frontend_dir := os.environ.get('BLACKBOX_E2E_FRONTEND_DIR'):
+            settings.frontend_dir = Path(frontend_dir)
         settings.prefs.model='fixture:4b'
         app=create_app(settings,SlowTransport())
+        app.state.db.execute('INSERT INTO model_capabilities VALUES (?,?,?,?,?)',
+            ('fixture-digest','fixture:4b',json.dumps({'capabilities':['completion','vision','tools'],'details':{}}),json.dumps({'vision':True,'tools':True}),0))
         (settings.data_dir/'workspace/recovery-notes.txt').write_text('controlled workspace evidence')
         # Mock execution only; real schema, policy, destination and evidence paths remain active.
         from blackbox.tools.base import ToolResult
@@ -95,7 +107,7 @@ if __name__=='__main__':
         async def route_fixture(ctx,target):
             return ToolResult(ok=True,summary='Mock loopback route and reachability',evidence=[{'target':target,'interface':'lo'}])
         network.preflight=route_fixture
-        runtime=Path(os.environ.get('BLACKBOX_E2E_RUNTIME', str(Path(__file__).resolve().parents[2]/'.runtime')))
+        runtime=Path(os.environ.get('BLACKBOX_E2E_RUNTIME', str(ROOT/'.runtime')))
         runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         runtime.mkdir(exist_ok=True)
         (runtime/'e2e-bearer').unlink(missing_ok=True)

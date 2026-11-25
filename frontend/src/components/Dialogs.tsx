@@ -51,7 +51,7 @@ export function ScopeDialog({sid, scope, close, saved, error}:any) {
   </form></div>;
 }
 
-export function SettingsDialog({prefs,models,close,saved,error,refresh}:any) {
+export function SettingsDialog({prefs,models,selectedModel,close,saved,error,refresh}:any) {
   useModalFocus(close);
   const [localError,setLocalError]=useState('');
   const [value,setValue]=useState({...prefs});
@@ -60,10 +60,10 @@ export function SettingsDialog({prefs,models,close,saved,error,refresh}:any) {
   const [profiles,setProfiles]=useState<any[]>([]);
   const change=(key:string,v:any)=>setValue({...value,[key]:v});
   async function submit(e:Event) {e.preventDefault();try {saved(await api('/config',{method:'PATCH',body:JSON.stringify(value)}));close();}catch(e){setLocalError(String(e));error(String(e));}}
-  async function runProbe(){setProbing(true);setProbe('Testing installed model with a small image and echo tool…');try {const r=await api(`/models/${encodeURIComponent(value.model)}/probe`,{method:'POST'});setProbe(`Vision ${r.vision?'PASS':'FAIL'} · Tools ${r.tools?'PASS':'FAIL'}`);await refresh();}catch(e){setProbe(String(e));}finally{setProbing(false);}}
+  async function runProbe(){const target=selectedModel || value.model;setProbing(true);setProbe(`Testing ${target} with a small image and echo tool…`);try {const r=await api(`/models/${encodeURIComponent(target)}/probe`,{method:'POST'});setProbe(`Vision ${r.vision?'verified':`failed: ${r.diagnostics?.vision?.message || 'unknown error'}`} · Tools ${r.tools?'verified':`failed: ${r.diagnostics?.tools?.message || 'unknown error'}`}`);await refresh();}catch(e){setProbe(String(e));}finally{setProbing(false);}}
   return <div class="modal-shade"><form class="modal" role="dialog" aria-modal="true" aria-label="Settings" onSubmit={submit}><h2>Settings</h2>
     <label class="field">Default model<select value={value.model} onChange={e=>change('model',e.currentTarget.value)}>{!models.some((m:any)=>m.name===value.model)&&<option>{value.model}</option>}{models.map((m:any)=><option value={m.name}>{m.name}</option>)}</select></label>
-    <button type="button" disabled={probing} onClick={runProbe}>Probe vision + tools</button>{probe&&<p role="status">{probe}</p>}
+    <button type="button" disabled={probing} onClick={runProbe}>Probe capabilities</button>{probe&&<p role="status">{probe}</p>}
     <label class="field">Vision fallback model<select value={value.vision_model || ''} onChange={e=>change('vision_model',e.currentTarget.value || null)}><option value="">Require selected model vision support</option>{models.filter((m:any)=>m.vision).map((m:any)=><option value={m.name}>{m.name}</option>)}</select></label>
     <label class="field">Scan freshness (seconds)<input type="number" min="0" max="86400" value={value.scan_freshness_seconds} onInput={e=>change('scan_freshness_seconds',Number(e.currentTarget.value))}/></label>
     <label class="field">HTTP requests per second<input type="number" min="1" max="5" value={value.http_rate} onInput={e=>change('http_rate',Number(e.currentTarget.value))}/></label>
