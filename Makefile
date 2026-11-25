@@ -11,3 +11,7 @@ build:
 	npm --prefix frontend run build
 smoke:
 	./scripts/smoke_test.sh
+
+.PHONY: qa-workspace
+qa-workspace:
+	.venv/bin/python scripts/qa_workspace.py
